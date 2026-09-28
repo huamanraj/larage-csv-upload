@@ -74,3 +74,7 @@ A `kill -9` of the worker at row 60,000, followed by a restart, produced exactly
 | `CHUNK_DELAY_MS` | `0` | pause between chunks (demo only) |
 
 Postgres settings for the box (see `docker-compose.yml`): `shared_buffers` at about 25% of RAM, and `max_wal_size=4GB`.
+
+## Design docs
+
+The justification, downsides, alternatives and a debate guide for design review are in [`docs/`](docs/README.md).
