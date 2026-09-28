@@ -101,6 +101,27 @@ input[type=range]::-moz-range-progress { height: 2px; background: var(--accent);
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 10px; margin-top: -4px; background: var(--text); border-radius: 1px; }
 input[type=range]::-moz-range-thumb { width: 10px; height: 10px; background: var(--text); border: 0; border-radius: 1px; }
 
+/* step info */
+.node .t { padding-right: 24px; }
+.info {
+  position: absolute; top: 9px; right: 9px; width: 17px; height: 17px; padding: 0; display: grid; place-items: center;
+  border: 1px solid var(--line-2); border-radius: 50%; background: var(--panel); color: var(--muted);
+  font: italic 500 10px/1 Georgia, serif; cursor: pointer; opacity: 1; transition: border-color .2s, color .2s, background .2s;
+}
+.info:hover, .info.on { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.lh .info { position: static; margin-left: auto; flex: none; }
+.lh .it + .info { margin-left: 8px; }
+.pop {
+  position: fixed; z-index: 40; width: 300px; max-width: calc(100vw - 32px); padding: 12px 14px; background: #0d0f12;
+  border: 1px solid var(--line-2); border-radius: var(--r); box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+  opacity: 0; transform: translateY(-4px); pointer-events: none; transition: opacity .18s, transform .18s var(--ease);
+}
+.pop.on { opacity: 1; transform: none; pointer-events: auto; }
+.pop .pt { font-size: 12.5px; color: #e6ebff; margin-bottom: 6px; }
+.pop p { margin: 6px 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
+.pop p b { display: block; font-weight: 500; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin-bottom: 1px; }
+.pop .py { color: var(--text); }
+
 .toast { position: fixed; right: 20px; bottom: 20px; padding: 10px 14px; background: #101318; border: 1px solid var(--line-2); border-radius: var(--r); font-size: 12px; opacity: 0; transform: translateY(6px); transition: opacity .25s, transform .25s var(--ease); pointer-events: none; }
 .toast.on { opacity: 1; transform: none; }
 .toast.err { border-color: rgba(212, 98, 95, .5); }

@@ -17,6 +17,48 @@
   const NODES = ['user', 'create', 'receive', 'write', 'hash', 'moreBytes', 'queued', 'push', 'pick', 'open',
     'read', 'validate', 'save', 'progress', 'moreRows', 'done'];
 
+  // What each step does and why it matters, shown by the (i) button on the step.
+  const INFO = {
+    user: ['User uploads CSV', 'The browser sends the file as the raw request body, not a multipart form.',
+      'The server can stream it straight to disk instead of buffering a 250 MB form in memory.'],
+    create: ['Create import row', 'An imports row is inserted with status uploading before any byte is stored.',
+      'The user gets an id at once, and an abandoned or failed upload is visible instead of lost.'],
+    upload: ['Upload stream loop', 'Receive, write and hash repeat for every piece until the body ends.',
+      'Memory stays at one piece (~64 KB) whether the file is 1 MB or 300 MB.'],
+    receive: ['Receive next piece', 'The server reads the next piece of the request body.',
+      'Only one small piece is in memory at a time, so large uploads never exhaust RAM.'],
+    write: ['Write piece to local storage', 'The piece is appended to /data/imports/{id}.csv.',
+      'The file lives on disk, not in memory or the database. The worker re-reads it later, and switching to S3 changes only this step.'],
+    hash: ['Update sha256', 'The piece is fed into a running sha256 of the whole file.',
+      'A fingerprint for free, with no second read. Uploading the same file to the same campaign again returns the existing import instead of importing twice.'],
+    moreBytes: ['More bytes?', 'Loop until the body ends; the size cap is checked on every piece.',
+      'An oversized upload is stopped mid-stream (413) instead of after filling the disk.'],
+    queued: ['Import row status queued', 'Once the file is stored and has a phone column, the row becomes queued.',
+      'A job is only visible to workers when its file is complete, so a worker never reads half a file.'],
+    queue: ['Job queue · Postgres', 'status = queued in the imports table is the queue. Only the import_id is passed on.',
+      'No Redis or Celery to run. The job and its data share one database, so progress and data can commit together. Celery or SQS could replace it without other changes.'],
+    push: ['Push import_id', 'The job becomes claimable by any worker.',
+      'Only a small id is queued; the file stays in storage and the state stays in the imports row.'],
+    pick: ['Worker picks up import_id', 'UPDATE … FOR UPDATE SKIP LOCKED claims the oldest queued import and sets a lease (worker_id, locked_at).',
+      'Two workers never take the same job. If a worker dies, its lease goes stale and another worker resumes the job.'],
+    open: ['Open file as a stream', 'The stored CSV is opened as a text stream and the phone, name and country columns are detected.',
+      'The file is never loaded whole, so worker memory stays flat for 1k or 1M rows.'],
+    chunk: ['Chunk loop', 'Read, validate and save repeat for every 10,000 rows until the file ends.',
+      'Each chunk is a small, self-contained transaction: bounded memory, steady progress, and a crash only redoes one chunk.'],
+    read: ['Read next rows', 'The next 10,000 rows are read; rows up to the checkpoint are skipped on a resume.',
+      'Chunks bound memory and keep each database write small.'],
+    validate: ['Validate rows', 'Each phone is cleaned to +E.164 across CPU cores. The first valid phone column wins; empty, invalid and Excel 9.19E+11 values are rejected.',
+      'The calling layer needs dialable numbers in one format, and one format is what makes duplicates detectable.'],
+    save: ['Save chunk to contacts', 'Valid rows are COPYed into a temp table, then INSERT … ON CONFLICT DO NOTHING into contacts. Rejects go to import_errors with a reason.',
+      'COPY is about 10× faster than row inserts, and the unique index guarantees one contact per phone per campaign.'],
+    progress: ['Save checkpoint + progress', 'checkpoint_row and the counters are updated in the same transaction as the saved rows.',
+      'Data and checkpoint commit together or not at all, so after a crash nothing is saved twice or lost.'],
+    moreRows: ['More rows?', 'Loop until the end of the file; the worker lease is refreshed on every chunk.',
+      'A fresh lease tells other workers this one is alive, so they do not take the job over.'],
+    done: ['Import row status done', 'Status becomes done and the final counts stay on the imports row.',
+      'Progress and totals are read from this one row, never by counting millions of contacts.'],
+  };
+
   const S = { id: null, events: [], lastEvent: 0, imp: null, segs: [], total: 0, t: 0, speed: 1, playing: false,
     shown: -1, timer: null, cfg: { chunk_size: 10000 } };
 
@@ -242,7 +284,49 @@
   }
 
   // ---------------------------------------------------------------- wiring
+  function wireInfo() {
+    const mk = key => {
+      const b = document.createElement('button');
+      b.className = 'info';
+      b.type = 'button';
+      b.textContent = 'i';
+      b.dataset.info = key;
+      b.setAttribute('aria-label', `About: ${INFO[key][0]}`);
+      return b;
+    };
+    $$('.node[data-n]').forEach(n => INFO[n.dataset.n] && n.appendChild(mk(n.dataset.n)));
+    $$('.loop[data-l]').forEach(l => INFO[l.dataset.l] && $('.lh', l).appendChild(mk(l.dataset.l)));
+
+    const pop = $('#pop');
+    let openBtn = null;
+    const close = () => { pop.classList.remove('on'); openBtn?.classList.remove('on'); openBtn = null; };
+    document.addEventListener('click', e => {
+      const b = e.target.closest('.info');
+      if (!b) { if (!e.target.closest('#pop')) close(); return; }
+      e.preventDefault();
+      if (openBtn === b) { close(); return; }
+      close();
+      const [title, what, why] = INFO[b.dataset.info];
+      $('.pt', pop).textContent = title;
+      $('.pw', pop).innerHTML = `<b>What</b>${esc(what)}`;
+      $('.py', pop).innerHTML = `<b>Why it matters</b>${esc(why)}`;
+      const r = b.getBoundingClientRect(), w = Math.min(300, window.innerWidth - 32);
+      const left = Math.max(16, Math.min(r.right - w, window.innerWidth - w - 16));
+      pop.style.left = `${left}px`;
+      pop.style.top = '0px';
+      pop.classList.add('on');
+      const h = pop.offsetHeight;
+      pop.style.top = `${r.bottom + 8 + h > window.innerHeight - 8 ? Math.max(8, r.top - h - 8) : r.bottom + 8}px`;
+      b.classList.add('on');
+      openBtn = b;
+    });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, { passive: true });
+  }
+
   function wire() {
+    wireInfo();
     const drop = $('#drop'), file = $('#file');
     file.addEventListener('change', () => { if (file.files[0]) upload(file.files[0]); file.value = ''; });
     ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
