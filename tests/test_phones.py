@@ -39,9 +39,18 @@ def test_region_for(value, expected):
 
 def test_country_decides_local_numbers():
     # A local UK number is also a valid Indian mobile: only the row's country tells them apart.
-    rows = [(1, "07775 559513", "a", "United Kingdom", None),
-            (2, "07775 559513", "b", "", None),
-            (3, "12", "c", "", '{"city": "Pune"}')]
+    rows = [(1, ("07775 559513",), "a", "United Kingdom", None),
+            (2, ("07775 559513",), "b", "", None),
+            (3, ("12",), "c", "", '{"city": "Pune"}')]
     ok, bad = validate_batch(rows, "IN")
     assert ok == [(1, "+447775559513", "a", None), (2, "+917775559513", "b", None)]
     assert bad == [(3, "12", "invalid")]
+
+
+def test_first_valid_phone_column_wins():
+    rows = [(1, ("", "555-555-1212", "+1 425 882 8080"), "a", "", None),   # fake 555 number skipped
+            (2, ("", "", ""), "b", "", None),
+            (3, ("n/a", "9.19E+11"), "c", "", None)]
+    ok, bad = validate_batch(rows, "IN")
+    assert ok == [(1, "+14258828080", "a", None)]
+    assert bad == [(2, None, "empty"), (3, "n/a", "invalid")]

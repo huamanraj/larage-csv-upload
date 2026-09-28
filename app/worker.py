@@ -18,6 +18,7 @@ from psycopg.rows import dict_row
 
 from . import config
 from .db import init_schema
+from .columns import resolve
 from .phones import validate_batch
 
 log = logging.getLogger("worker")
@@ -90,12 +91,10 @@ class Job:
         t_start = time.monotonic()
         with open(self.job["file_path"], newline="", encoding="utf-8-sig", errors="replace") as f:
             reader = csv.reader(f)
-            header = [h.strip().lower() for h in next(reader, [])]
-            col = {h: i for i, h in reversed(list(enumerate(header)))}  # first occurrence wins
-            if "phone" not in col:
-                raise RuntimeError("CSV must have a 'phone' column")
-            p, nm, ct = col["phone"], col.get("name"), col.get("country")
-            extra = [(h, i) for i, h in enumerate(header) if i not in (p, nm, ct) and h]
+            cols = resolve(next(reader, []))
+            if not cols["phones"]:
+                raise RuntimeError("no phone column found")
+            phones, names, countries, extra = cols["phones"], cols["name"], cols["country"], cols["extra"]
             with self.conn.cursor() as cur:
                 event(cur, self.id, "opened", {"path": self.job["file_path"], "bytes": self.job["file_size"]})
 
@@ -107,8 +106,10 @@ class Job:
                 row_no += 1
                 if row_no <= self.checkpoint or not rec:  # already saved before a restart
                     continue
-                vars_json = json.dumps({h: cell(rec, i) for h, i in extra if cell(rec, i)}) if extra else None
-                chunk.append((row_no, cell(rec, p), cell(rec, nm), cell(rec, ct), vars_json))
+                vars_json = json.dumps({h: v for h, i in extra if (v := cell(rec, i))}) if extra else None
+                name = " ".join(v for i in names if (v := cell(rec, i)))
+                country = next((v for i in countries if (v := cell(rec, i))), "")
+                chunk.append((row_no, tuple(cell(rec, i) for i in phones), name, country, vars_json))
                 if len(chunk) >= config.CHUNK_SIZE:
                     self.flush(chunk, row_no, time.monotonic() - t_read)
                     if STOP.is_set():

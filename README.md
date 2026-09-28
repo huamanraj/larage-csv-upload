@@ -6,14 +6,25 @@ Three processes run on one server: `api` (uvicorn), `worker` (its own process wi
 
 ## CSV schema
 
+Two layouts are accepted as they are, with no mapping step (see `app/columns.py`):
+
+**Simple**
+
 | Column | Required | Notes |
 |---|---|---|
 | `phone` | yes | any country: `+44 7911 123456`, `0044…`, `07911 123456` (with `country`), `98765 43210` |
 | `name` | no | |
 | `country` | no | `India`, `IN`, `UK`, `USA`, `+44`, … Used for numbers written without a country code. If it's empty, `DEFAULT_REGION` is used |
-| anything else | no | kept as `contacts.vars` (jsonb) |
+| anything else | no | kept in `contacts.vars` (jsonb), non-empty values only |
 
-Header names are case-insensitive. An upload without a `phone` column is rejected with a 422 error.
+**Outlook contacts export** (the standard ~92-column file)
+
+- **Phone:** the first valid number among `Mobile Phone → Number → Primary Phone → Business Phone → Home Phone → …` wins. Fax, pager and ID-number columns are never used.
+- **Name:** `First Name + Middle Name + Last Name`.
+- **Country:** `Home Country/Region`, else `Business Country/Region`.
+- **Everything else** (company, e-mail, address, …) goes into `vars`.
+
+Header names are case-insensitive. A file with no usable phone column is rejected with a 422 error. A row whose numbers are all invalid ends up in `import_errors` with its reason. For example, Outlook's placeholder `555-555-1212` is not a real number, so it's rejected.
 
 ## Run
 

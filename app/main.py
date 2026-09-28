@@ -1,10 +1,10 @@
 """HTTP API + static UI.  Run: uvicorn app.main:app
 
-Expected CSV schema (header names, case-insensitive):
-  phone    required
-  name     optional
-  country  optional, used for numbers written without a country code
-  anything else is kept in contacts.vars
+Accepted CSV layouts (header names, case-insensitive), see app/columns.py:
+  simple:  phone (required), name, country, + any other columns
+  Outlook: Mobile Phone / Number / Primary Phone / Business Phone ..., First/Last Name, Country/Region
+Numbers without a country code are read in the row's country, else DEFAULT_REGION.
+Other non-empty columns are kept in contacts.vars.
 """
 import csv
 import hashlib
@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from . import config
+from .columns import resolve
 from .db import init_schema
 
 STATIC = Path(__file__).parent / "static"
@@ -62,7 +63,7 @@ async def event(conn, import_id, kind, data, at=None):
 
 def read_header(path):
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
-        return [h.strip().lower() for h in next(csv.reader(f), [])]
+        return next(csv.reader(f), [])
 
 
 @app.post("/api/imports", status_code=202)
@@ -101,8 +102,8 @@ async def upload(request: Request, campaign_id: int = 1):
         samples.append([round((time.monotonic() - t0) * 1000, 1), size, h.hexdigest()[:16]])
         if size == 0:
             raise HTTPException(400, "empty file")
-        if "phone" not in read_header(path):
-            raise HTTPException(422, "CSV must have a 'phone' column (optional: name, country)")
+        if not resolve(read_header(path))["phones"]:
+            raise HTTPException(422, "no phone column: use 'phone' (or an Outlook export with Mobile/Business/Primary Phone)")
     except BaseException as e:
         path.unlink(missing_ok=True)
         async with pool.connection() as conn:

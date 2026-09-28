@@ -83,12 +83,22 @@ def normalize(raw, region="IN"):
 
 
 def validate_batch(rows, region):
-    """rows: [(row_no, phone, name, country, vars_json)] -> (valid rows, rejected rows)."""
+    """rows: [(row_no, (phone candidates in priority order), name, country, vars_json)].
+
+    The first valid candidate wins. A rejected row reports its first non-empty value and why.
+    """
     ok, bad = [], []
-    for row_no, phone, name, country, vars_json in rows:
-        e164, reason = normalize(phone, region_for(country, region))
+    for row_no, phones, name, country, vars_json in rows:
+        row_region = region_for(country, region)
+        e164, first = None, None
+        for raw in phones:
+            e164, reason = normalize(raw, row_region)
+            if e164:
+                break
+            if first is None and reason != "empty":
+                first = (raw, reason)
         if e164:
             ok.append((row_no, e164, name or None, vars_json))
         else:
-            bad.append((row_no, phone or None, reason))
+            bad.append((row_no, *(first or (None, "empty"))))
     return ok, bad
