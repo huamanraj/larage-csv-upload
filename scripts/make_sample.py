@@ -31,6 +31,17 @@ def mobile(rng):
     return f"({n[:3]}) {n[3:6]}-{n[6:]}"
 
 
+# Foreign contacts, written the way local users type them (no country code), plus the country column.
+FOREIGN = [
+    ("United States", lambda r: f"({r.randrange(201, 989)}) {r.randrange(200, 999)}-{r.randrange(1000, 9999)}"),
+    ("United Kingdom", lambda r: f"07{r.randrange(100, 999)} {r.randrange(100000, 999999)}"),
+    ("UAE", lambda r: f"05{r.choice('024568')} {r.randrange(100, 999)} {r.randrange(1000, 9999)}"),
+    ("Singapore", lambda r: f"{r.choice('89')}{r.randrange(100, 999)} {r.randrange(1000, 9999)}"),
+    ("UK", lambda r: f"+44 7{r.randrange(100, 999)} {r.randrange(100000, 999999)}"),
+    ("USA", lambda r: f"1{r.randrange(201, 989)}{r.randrange(200, 999)}{r.randrange(1000, 9999)}"),
+]
+
+
 def messy(rng):
     r = rng.random()
     if r < 0.04:
@@ -52,12 +63,17 @@ def main(n, out):
         w.writerow(HEADERS)
         for i in range(n):
             fn, ln, city = rng.choice(FIRST), rng.choice(LAST), rng.choice(CITIES)
+            country = "India"
             r = rng.random()
-            mob = rng.choice(pool) if r < 0.80 else ("" if r < 0.90 else messy(rng))
+            if r < 0.10:
+                country, fmt = rng.choice(FOREIGN)
+                mob = fmt(rng)
+            else:
+                mob = rng.choice(pool) if r < 0.80 else ("" if r < 0.90 else messy(rng))
             prim = mobile(rng) if (not mob and rng.random() < 0.5) else ("" if rng.random() < 0.7 else messy(rng))
             w.writerow([fn, "", ln, "", "", "", f"{fn}.{ln}{i}@example.com".lower(), "", mob, prim, "",
                         messy(rng) if rng.random() < 0.3 else "", "", rng.choice(COMPANIES), "", "Manager",
-                        f"{rng.randrange(1, 300)} MG Road", city, "", str(rng.randrange(400001, 700000)), "India",
+                        f"{rng.randrange(1, 300)} MG Road", city, "", str(rng.randrange(400001, 700000)), country,
                         "", city, "", "", "", "Leads", ""])
 
 

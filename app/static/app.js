@@ -47,7 +47,7 @@
 
   const S = {
     cfg: null, id: null, imp: null, view: null, timer: null, lastEvent: 0, phase: 'idle',
-    preview: null, m: { phones: [], name: null, vars: [], region: 'IN', landline: false },
+    preview: null, m: { phones: [], name: null, vars: [], country: null, region: 'IN', landline: false, infer: true },
     run: null, res: null, lockedAt: null,
   };
 
@@ -222,20 +222,42 @@
   }
 
   // ------------------------------------------------------------ mapping
+  async function rescore() {
+    // Validity in the sample depends on the country column and default country, so re-score on change.
+    const q = new URLSearchParams({ country_column: S.m.country || '', region: $('#region').value || S.m.region });
+    try {
+      const p = await api(`/api/imports/${S.id}/preview?${q}`);
+      if (S.view !== 'map' || !S.preview) return;
+      S.preview.columns = p.columns;
+      renderCols();
+      renderMapping();
+    } catch (_) { /* keep the current scores */ }
+  }
+
   async function loadPreview() {
     const p = await api(`/api/imports/${S.id}/preview`);
     S.preview = p;
     const src = p.mapping || p.suggested;
     S.m = {
       phones: [...(src.phone_columns || [])], name: src.name_column || null, vars: [...(src.var_columns || [])],
-      region: p.default_region || 'IN', landline: !!src.reject_landline,
+      country: src.country_column || null, region: p.default_region || 'IN',
+      landline: !!src.reject_landline, infer: src.infer_country_code !== false,
     };
+    fillRegions();
     $('#region').value = S.m.region;
     $('#landline').checked = S.m.landline;
+    $('#inferCc').checked = S.m.infer;
     $('#colFilter').value = '';
     $('#colCount').textContent = `${p.headers.length} · ${p.rows.length} sampled`;
     renderCols();
     renderMapping();
+  }
+
+  function fillRegions() {
+    const sel = $('#region');
+    if (sel.options.length) return;
+    const regions = S.cfg?.regions || [['IN', 'India'], ['US', 'United States'], ['GB', 'United Kingdom']];
+    sel.innerHTML = regions.map(([code, name]) => `<option value="${esc(code)}">${esc(name)} · ${esc(code)}</option>`).join('');
   }
 
   function renderCols() {
@@ -256,6 +278,7 @@
         <div class="tg">
           <button class="chip ph-c" data-act="phone">phone</button>
           <button class="chip nm" data-act="name">name</button>
+          <button class="chip ct" data-act="country">country</button>
           <button class="chip vr" data-act="var">var</button>
         </div></div>`;
     }).join('') || '<div class="empty">no match</div>';
@@ -271,6 +294,7 @@
       pc.textContent = pi >= 0 ? `phone ${pi + 1}` : 'phone';
       $('[data-act="name"]', r).classList.toggle('on', S.m.name === h);
       $('[data-act="var"]', r).classList.toggle('on', S.m.vars.includes(h));
+      $('[data-act="country"]', r).classList.toggle('on', S.m.country === h);
       r.classList.toggle('is-phone', pi >= 0);
     });
   }
@@ -291,6 +315,7 @@
         </span>
       </div>`).join('') : '<div class="none">pick at least one phone column</div>';
     $('#nameTag').innerHTML = m.name ? `<span class="tag">${esc(m.name)}<button class="ib" data-act="rmname"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></span>` : '<span class="none">none</span>';
+    $('#countryTag').innerHTML = m.country ? `<span class="tag">${esc(m.country)}<button class="ib" data-act="rmcountry"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></span>` : '<span class="none">none, every row uses the default country</span>';
     $('#varTags').innerHTML = m.vars.length ? m.vars.map(v => `<span class="tag" data-h="${esc(v)}">${esc(v)}<button class="ib" data-act="rmvar"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></span>`).join('') : '<span class="none">none</span>';
     $('#startBtn').disabled = !m.phones.length;
     syncChips();
@@ -301,6 +326,7 @@
     const m = S.m;
     if (act === 'phone') m.phones = m.phones.includes(h) ? m.phones.filter(x => x !== h) : [...m.phones, h];
     else if (act === 'name') m.name = m.name === h ? null : h;
+    else if (act === 'country') { m.country = m.country === h ? null : h; renderMapping(); rescore(); return; }
     else if (act === 'var') m.vars = m.vars.includes(h) ? m.vars.filter(x => x !== h) : [...m.vars, h];
     renderMapping();
   }
@@ -313,7 +339,8 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           phone_columns: S.m.phones, name_column: S.m.name, var_columns: S.m.vars,
-          default_region: $('#region').value, reject_landline: $('#landline').checked,
+          country_column: S.m.country, default_region: $('#region').value,
+          reject_landline: $('#landline').checked, infer_country_code: $('#inferCc').checked,
         }),
       });
       await openImport(S.id);
@@ -503,8 +530,8 @@
         R.queuedAt = at; S.phase = 'queued';
         if (d.retry) log(e, `re-queued · resumes after row <b>${fmt(d.checkpoint_row)}</b>`);
         else {
-          const extra = [d.name_column ? `name <b>${esc(d.name_column)}</b>` : '', d.var_columns?.length ? `vars <b>${esc(d.var_columns.join(', '))}</b>` : ''].filter(Boolean).join(' · ');
-          log(e, `mapping locked · phone <b>${esc((d.phone_columns || []).join(' → '))}</b>${extra ? ' · ' + extra : ''} · region <b>${esc(d.default_region)}</b> · <b>queued</b>`);
+          const extra = [d.name_column ? `name <b>${esc(d.name_column)}</b>` : '', d.country_column ? `country <b>${esc(d.country_column)}</b>` : '', d.var_columns?.length ? `vars <b>${esc(d.var_columns.join(', '))}</b>` : ''].filter(Boolean).join(' · ');
+          log(e, `mapping locked · phone <b>${esc((d.phone_columns || []).join(' → '))}</b>${extra ? ' · ' + extra : ''} · default <b>${esc(d.default_region)}</b> · <b>queued</b>`);
         }
         break;
       case 'claimed':
@@ -740,6 +767,8 @@
       renderMapping();
     });
     $('#nameTag').addEventListener('click', e => { if (e.target.closest('[data-act="rmname"]')) { S.m.name = null; renderMapping(); } });
+    $('#countryTag').addEventListener('click', e => { if (e.target.closest('[data-act="rmcountry"]')) { S.m.country = null; renderMapping(); rescore(); } });
+    $('#region').addEventListener('change', rescore);
     $('#varTags').addEventListener('click', e => {
       const b = e.target.closest('[data-act="rmvar"]'); if (!b) return;
       const h = b.closest('.tag').dataset.h; S.m.vars = S.m.vars.filter(v => v !== h); renderMapping();

@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from . import config
 from .db import init_schema
-from .phones import score_columns, suggest_name
+from .phones import REGIONS, score_columns, suggest_country, suggest_name
 
 STATIC = Path(__file__).parent / "static"
 pool: AsyncConnectionPool = None  # opened in lifespan
@@ -49,7 +49,8 @@ async def index():
 @app.get("/api/config")
 async def get_config():
     return {"chunk_size": config.CHUNK_SIZE, "pool_size": config.POOL_SIZE, "max_upload_bytes": config.MAX_UPLOAD_BYTES,
-            "concurrency": config.IMPORT_CONCURRENCY, "preview_rows": config.PREVIEW_ROWS}
+            "concurrency": config.IMPORT_CONCURRENCY, "preview_rows": config.PREVIEW_ROWS,
+            "regions": REGIONS}
 
 
 # ---------------------------------------------------------------- 1. upload
@@ -138,7 +139,8 @@ def read_head(path, n):
 
 
 @app.get("/api/imports/{import_id}/preview")
-async def preview(import_id: int):
+async def preview(import_id: int, country_column: str | None = None, region: str | None = None):
+    """Scores use the country column (suggested one unless given) so foreign numbers aren't misread."""
     async with pool.connection() as conn:
         imp = await get_import(conn, import_id)
     if not Path(imp["file_path"]).exists():
@@ -146,11 +148,15 @@ async def preview(import_id: int):
     headers, rows = read_head(imp["file_path"], config.PREVIEW_ROWS)
     if not headers:
         raise HTTPException(422, "file has no header row")
-    scores = score_columns(headers, rows, imp["default_region"])
+    suggested_country = suggest_country(headers)
+    country = suggested_country if country_column is None else (country_column or None)
+    country_idx = headers.index(country) if country in headers else None
+    scores = score_columns(headers, rows, (region or imp["default_region"]).upper(), country_idx)
     ranked = sorted(scores, key=lambda s: s["score"], reverse=True)
     phones = [s["header"] for s in ranked if s["valid_pct"] >= 0.2 and (s["name_score"] > 0 or s["valid_pct"] >= 0.6)][:3]
     return {"headers": headers, "rows": rows, "columns": scores,
-            "suggested": {"phone_columns": phones, "name_column": suggest_name(headers), "var_columns": []},
+            "suggested": {"phone_columns": phones, "name_column": suggest_name(headers), "var_columns": [],
+                          "country_column": suggested_country, "infer_country_code": True},
             "mapping": imp["mapping"], "default_region": imp["default_region"]}
 
 
@@ -160,14 +166,19 @@ class Mapping(BaseModel):
     var_columns: list[str] = []
     default_region: str = Field("IN", min_length=2, max_length=2)
     reject_landline: bool = False
+    country_column: str | None = None   # per-row country for numbers written without a country code
+    infer_country_code: bool = True     # retry 11+ digit numbers as if the '+' was dropped
 
 
 @app.post("/api/imports/{import_id}/mapping")
 async def set_mapping(import_id: int, m: Mapping):
+    if m.default_region.upper() not in {code for code, _ in REGIONS}:
+        raise HTTPException(422, f"unknown region {m.default_region}")
     async with pool.connection() as conn:
         imp = await get_import(conn, import_id)
         headers, _ = read_head(imp["file_path"], 0)
-        missing = [c for c in [*m.phone_columns, *m.var_columns, *([m.name_column] if m.name_column else [])]
+        missing = [c for c in [*m.phone_columns, *m.var_columns, *([m.name_column] if m.name_column else []),
+                                *([m.country_column] if m.country_column else [])]
                    if c not in headers]
         if missing:
             raise HTTPException(422, f"unknown columns: {missing}")

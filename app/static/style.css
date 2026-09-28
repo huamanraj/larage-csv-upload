@@ -183,7 +183,7 @@ button, input, select { font: inherit; color: inherit; }
 .filter:focus { border-color: var(--line-2); }
 .clist { max-height: 560px; overflow: auto; }
 .cr {
-  display: grid; grid-template-columns: minmax(0, 1fr) 120px 186px; gap: 14px; align-items: center;
+  display: grid; grid-template-columns: minmax(0, 1fr) 110px 250px; gap: 14px; align-items: center;
   padding: 9px 12px; border-bottom: 1px solid var(--line); transition: background .25s;
   animation: rise .35s var(--ease) both;
 }
@@ -206,6 +206,7 @@ button, input, select { font: inherit; color: inherit; }
 .chip:hover { border-color: var(--line-2); color: var(--text); }
 .chip.on { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
 .chip.on.nm { border-color: var(--ok); color: var(--ok); background: rgba(79, 180, 136, .1); }
+.chip.on.ct { border-color: #6fb6c9; color: #6fb6c9; background: rgba(111, 182, 201, .1); }
 .chip.on.vr { border-color: var(--dup); color: var(--dup); background: rgba(201, 163, 91, .1); }
 @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 
@@ -229,7 +230,9 @@ button, input, select { font: inherit; color: inherit; }
 .tags { display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px; }
 .tag { height: 24px; display: inline-flex; align-items: center; gap: 6px; padding: 0 4px 0 8px; border: 1px solid var(--line); border-radius: var(--r); font-size: 12px; animation: rise .3s var(--ease) both; }
 .none { color: var(--faint); font-size: 12px; line-height: 24px; }
-.opts { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.opts { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-top: 10px; flex-wrap: wrap; }
+.field.wide { display: flex; width: 100%; }
+.field.wide select { flex: 1; min-width: 0; width: 100%; background: var(--panel); }
 .sw { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: var(--muted); user-select: none; }
 .sw input { display: none; }
 .sw i { width: 26px; height: 14px; border: 1px solid var(--line-2); border-radius: 2px; position: relative; transition: border-color .2s, background .2s; }

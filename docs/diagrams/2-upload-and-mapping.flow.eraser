@@ -25,8 +25,9 @@ Preview [icon: eye, color: blue] {
 Mapping [icon: sliders, color: purple] {
   User sets phone priority list [icon: list]
   User picks name column [icon: user-check]
+  User picks country column [icon: map-pin]
   User picks vars to keep [icon: tag]
-  User sets region and landline rule [icon: globe]
+  User sets default country and rules [icon: globe]
 }
 
 Set status queued and enqueue [shape: oval, icon: send, color: orange]
@@ -47,6 +48,8 @@ Valid sample share > Column score: weight 0.6
 Column score > Suggest phone order and name
 Suggest phone order and name > User sets phone priority list
 User sets phone priority list > User picks name column
-User picks name column > User picks vars to keep
-User picks vars to keep > User sets region and landline rule
-User sets region and landline rule > Set status queued and enqueue
+User picks name column > User picks country column
+User picks country column > Read first 50 rows only: re-score per row country
+User picks country column > User picks vars to keep
+User picks vars to keep > User sets default country and rules
+User sets default country and rules > Set status queued and enqueue

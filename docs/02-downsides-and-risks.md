@@ -4,6 +4,7 @@ This section is deliberately blunt. Every item has a severity for *our* scale (u
 
 | # | Downside | Severity now | Gets worse when… |
 |---|---|---|---|
+| 0 | Numbers without a country code are ambiguous | **High** | Files mix countries and have no country column |
 | 1 | Single box = single point of failure | High | We promise uptime or add nodes |
 | 2 | Uploads go through our API and can't resume | Medium–High | Users have slow or flaky connections (mobile, office VPN) |
 | 3 | Head-of-line blocking with 1 import slot | Medium | Many users import at the same time |
@@ -20,6 +21,20 @@ This section is deliberately blunt. Every item has a severity for *our* scale (u
 | 14 | Polling-based progress | Very low | Hundreds of people watching imports at once |
 
 ---
+
+### 0. Numbers without a country code are ambiguous
+
+- **What:** a local UK number (`07775 559513`) and a local US number (`(717) 751-1028`) are *also* valid Indian mobiles.
+  - If the file has no country column, they're read in the default country.
+  - The result is a **valid but wrong** number. It won't show up as a rejection; the campaign dials a stranger.
+  - Measured: 2,955 of about 10,000 foreign rows in a mixed test file.
+- **Mitigation now:**
+  - Map a country column (auto-suggested when the header says "country").
+  - Set the default country to the list's main country.
+  - Numbers written with `+` or `00` are never ambiguous.
+- **Mitigation next:**
+  - Warn in the mapping step when no country column is mapped and the sample contains numbers valid in more than one country.
+  - Record in each contact which rule decided its country, so suspicious ones can be reviewed before dialling.
 
 ### 1. Single box = single point of failure
 

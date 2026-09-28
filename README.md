@@ -24,6 +24,8 @@ Make test data (Outlook-style, with messy phones, Excel `9.19E+11` values, landl
 python scripts/make_sample.py 1000000 contacts_1m.csv
 ```
 
+Run the tests with `pip install -r requirements-dev.txt && python -m pytest tests`.
+
 To slow a demo down so the chunk animation is easy to follow, set `CHUNK_DELAY_MS=150` on the worker.
 
 ## Flow
@@ -31,9 +33,9 @@ To slow a demo down so the chunk animation is easy to follow, set `CHUNK_DELAY_M
 | # | Stage | Where |
 |---|---|---|
 | 1 | `POST /api/imports?campaign_id=` returns `202 {import_id}`. The raw body goes from `request.stream()` straight to disk, with the sha256 computed on the fly. A size cap is enforced, and `UNIQUE (campaign_id, file_sha256)` makes a re-upload idempotent: it returns the existing id. | `app/main.py` |
-| 2 | `GET /api/imports/{id}/preview` reads the first 50 rows and scores each column as a phone column (header name match plus the share of valid sampled values). `POST /api/imports/{id}/mapping` takes the phone **priority list**, the name column, the `vars` columns, the region (`IN` by default) and the optional landline rejection, and sets the status to `queued`. | `app/main.py`, `app/phones.py` |
+| 2 | `GET /api/imports/{id}/preview` reads the first 50 rows and scores each column as a phone column (header name match plus the share of valid sampled values). `POST /api/imports/{id}/mapping` takes the phone **priority list**, the name column, the `vars` columns, an optional **country column** (per-row country for numbers written without a country code), the default country (`IN` by default), "detect missing +" and the optional landline rejection, and sets the status to `queued`. | `app/main.py`, `app/phones.py` |
 | 3 | The worker claims a job with `SKIP LOCKED` and sets `locked_at`. An advisory lock serialises claims, so the global `IMPORT_CONCURRENCY` limit holds across worker processes. A lock older than `LOCK_TIMEOUT` is re-claimed. | `app/worker.py` |
-| 4 | A streaming CSV reader cuts the file into 10k-row chunks. Each chunk is validated across a `ProcessPoolExecutor` sized to cores − 1. The fast path `^(?:91\|0)?([6-9]\d{9})$` handles most Indian numbers, and `phonenumbers` handles the rest. Rejection reasons are `empty`, `invalid`, `sci_notation` and `landline`. | `app/worker.py`, `app/phones.py` |
+| 4 | A streaming CSV reader cuts the file into 10k-row chunks. Each chunk is validated across a `ProcessPoolExecutor` sized to cores − 1. Numbers from any country are accepted. A `+` or `00` prefix is read as international, a number without one is read in the row's country (country column, else the default), and 11+ digit numbers that fail are retried as if the `+` was dropped. A regex fast path handles Indian mobiles, and `phonenumbers` handles everything else. Rejection reasons are `empty`, `invalid`, `sci_notation` and `landline`. | `app/worker.py`, `app/phones.py` |
 | 5 | Each chunk is one transaction: `COPY` into the temp `stage` table, `COPY` into `import_errors`, merge with `DISTINCT ON` + `ON CONFLICT DO NOTHING`, then update the checkpoint and counters. The checkpoint commits with the data, so a restart skips rows `<= checkpoint_row` and nothing is processed twice. | `app/worker.py` |
 | 6 | Contacts use keyset pagination: `GET /api/campaigns/{cid}/contacts?status=&after_id=`. Rejected rows use `GET /api/imports/{id}/errors?after_row=`. Both exports stream through `COPY TO STDOUT` (`…/contacts.csv`, `…/errors.csv`). Counters are read from `imports`, never from `COUNT(*)`. | `app/main.py` |
 

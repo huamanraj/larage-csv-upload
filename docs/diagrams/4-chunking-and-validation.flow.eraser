@@ -12,12 +12,16 @@ Keep only mapped columns [icon: filter]
 Split chunk across process pool [icon: cpu]
 
 Per row validation [icon: check-circle, color: blue] {
+  Row country from country column else default [icon: map-pin]
   Next phone column by priority [icon: list]
   Value empty [shape: diamond]
   Excel scientific notation [shape: diamond]
   Strip non digits [icon: scissors]
-  Fast regex matches India mobile [shape: diamond, icon: zap]
-  phonenumbers says valid [shape: diamond, icon: search]
+  Starts with plus or 00 [shape: diamond, icon: globe]
+  Indian mobile fast path [shape: diamond, icon: zap]
+  Valid as international number [shape: diamond, icon: search]
+  Valid in row country [shape: diamond, icon: search]
+  11 plus digits and detect missing plus on [shape: diamond, icon: help-circle]
   Landline and rule enabled [shape: diamond, icon: phone-off]
   Remember first reason [icon: bookmark]
   More phone columns [shape: diamond]
@@ -36,17 +40,24 @@ Open CSV as a stream > Skip rows up to checkpoint_row
 Skip rows up to checkpoint_row > Take next 10k rows
 Take next 10k rows > Keep only mapped columns
 Keep only mapped columns > Split chunk across process pool
-Split chunk across process pool > Next phone column by priority
+Split chunk across process pool > Row country from country column else default
+Row country from country column else default > Next phone column by priority
 Next phone column by priority > Value empty
 Value empty > More phone columns: yes
 Value empty > Excel scientific notation: no
 Excel scientific notation > Remember first reason: yes sci_notation
 Excel scientific notation > Strip non digits: no
-Strip non digits > Fast regex matches India mobile
-Fast regex matches India mobile > Landline and rule enabled: yes about 90 percent
-Fast regex matches India mobile > phonenumbers says valid: no
-phonenumbers says valid > Landline and rule enabled: yes
-phonenumbers says valid > Remember first reason: no invalid
+Strip non digits > Indian mobile fast path: India or +91
+Indian mobile fast path > Landline and rule enabled: match
+Indian mobile fast path > Starts with plus or 00: no match
+Starts with plus or 00 > Valid as international number: yes
+Starts with plus or 00 > Valid in row country: no
+Valid in row country > Landline and rule enabled: yes
+Valid in row country > 11 plus digits and detect missing plus on: no
+11 plus digits and detect missing plus on > Valid as international number: yes retry with plus
+11 plus digits and detect missing plus on > Remember first reason: no invalid
+Valid as international number > Landline and rule enabled: yes
+Valid as international number > Remember first reason: no invalid
 Landline and rule enabled > Remember first reason: yes landline
 Landline and rule enabled > Valid E164 number: no
 Remember first reason > More phone columns

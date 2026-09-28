@@ -73,12 +73,19 @@
           <div class="tags" id="nameTag"></div>
         </div>
         <div class="msec">
+          <div class="mlab">country <em>for numbers without +code</em></div>
+          <div class="tags" id="countryTag"></div>
+        </div>
+        <div class="msec">
           <div class="mlab">vars <em>kept as jsonb</em></div>
           <div class="tags" id="varTags"></div>
         </div>
-        <div class="msec opts">
-          <label class="field"><span>region</span><select id="region"><option>IN</option><option>US</option><option>GB</option><option>AE</option><option>SG</option><option>AU</option></select></label>
-          <label class="sw"><input type="checkbox" id="landline"><i></i>reject landlines</label>
+        <div class="msec">
+          <label class="field wide"><span>default country</span><select id="region"></select></label>
+          <div class="opts">
+            <label class="sw" title="447911123456 is read as +44 7911 123456 when it is not valid in the row's country"><input type="checkbox" id="inferCc" checked><i></i>detect missing +</label>
+            <label class="sw"><input type="checkbox" id="landline"><i></i>reject landlines</label>
+          </div>
         </div>
         <div class="go"><button class="btn primary" id="startBtn" disabled>start import</button></div>
       </div>

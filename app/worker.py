@@ -105,6 +105,8 @@ class Job:
         self.var_cols = m.get("var_columns") or []
         self.region = job["default_region"]
         self.reject_landline = bool(m.get("reject_landline"))
+        self.country_col = m.get("country_column")
+        self.infer_cc = m.get("infer_country_code", True)
 
     def run(self):
         path = Path(self.job["file_path"])
@@ -126,6 +128,7 @@ class Job:
             except KeyError as e:
                 raise RuntimeError(f"mapped column {e} not in file")
             name_idx = pos.get(self.name_col) if self.name_col else None
+            country_idx = pos.get(self.country_col) if self.country_col else None
 
             def get(rec, i):
                 return rec[i] if i is not None and i < len(rec) else ""
@@ -138,7 +141,7 @@ class Job:
                 if not rec:
                     continue
                 chunk.append((row_no, tuple(get(rec, i) for i in phone_idx), get(rec, name_idx),
-                              tuple(get(rec, i) for i in var_idx)))
+                              tuple(get(rec, i) for i in var_idx), get(rec, country_idx)))
                 if len(chunk) >= config.CHUNK_SIZE:
                     self.flush(chunk, row_no, time.monotonic() - t_read)
                     chunk = []
@@ -157,7 +160,8 @@ class Job:
         k = max(1, min(config.POOL_SIZE, len(chunk) // 500 or 1))
         size = -(-len(chunk) // k) if chunk else 0
         futures = [self.pool.submit(validate_batch, chunk[i:i + size], self.var_cols, self.region,
-                                    self.reject_landline) for i in range(0, len(chunk), size)] if chunk else []
+                                    self.reject_landline, self.infer_cc)
+                   for i in range(0, len(chunk), size)] if chunk else []
         ok, bad, fast, chunk_reasons = [], [], 0, {}
         for fut in futures:
             o, b, reasons, f_ = fut.result()

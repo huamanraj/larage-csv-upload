@@ -65,11 +65,21 @@ Users upload contact lists, usually exported from Outlook or Excel, to feed a ca
 - One pool slot is left free for the API and Postgres.
 - A global limit of **1–2 concurrent imports** (enforced across worker processes with an advisory lock around the claim) keeps a 1M-row file from starving everything else.
 
-### D5. Fast path before `phonenumbers`
+### D5. Any country, with a fast path for the common case
 
-- The steps are: strip non-digits, then match `^(?:91|0)?([6-9]\d{9})$`, which gives `+91XXXXXXXXXX` directly.
-- In our realistic sample, **99% of valid rows took the fast path**.
-- The measured fast path runs at about 350k rows/s per core, against about 25k rows/s for `phonenumbers.parse`. Only the leftovers (foreign numbers, odd formats) pay the slow cost.
+Lists mix countries (India, US, UK, UAE, …), so each number is resolved in this order:
+
+1. **`+` or `00` prefix:** the number carries its own country code, so it's parsed as international. `011` works for US files.
+2. **No prefix:** it's parsed as a national number of the **row's country**. That comes from the mapped country column (`India`, `IN`, `UK`, `USA`, `+44` and other common spellings all work), else from the import's default country.
+3. **"Detect missing +"** (on by default): an 11+ digit number that fails step 2 is retried as international, so `447911123456` becomes `+44 7911 123456`. Shorter numbers are never guessed.
+
+**Why the country column matters.** Local formats collide across countries:
+- UK `07775 559513` is also a valid Indian mobile.
+- US `(717) 751-1028` is also a valid Indian mobile.
+
+With the default set to India and no country column, a test file with 10% foreign rows had **2,955 numbers silently turned into different, real Indian numbers**. With the `Home Country` column mapped, all of them came out right. The UI suggests a column whose header contains "country", and the preview re-scores when you change it.
+
+**Speed.** A regex fast path (`^(?:91|0)?([6-9]\d{9})$`) turns Indian mobiles into `+91XXXXXXXXXX` without the slow parser. It runs at about 350k rows/s per core, against about 25k rows/s for `phonenumbers.parse`. On a mostly-Indian sample, about 90–99% of valid rows took the fast path. Every other country goes through `phonenumbers`: roughly 1M foreign rows in about 15 s across 3 cores (*estimate*).
 - Rejections carry a reason: `empty`, `invalid`, `sci_notation` (unrecoverable, because Excel already dropped the digits) and `landline` (optional).
 
 ### D6. Ten-thousand-row chunks, each one transaction: COPY → merge → checkpoint
