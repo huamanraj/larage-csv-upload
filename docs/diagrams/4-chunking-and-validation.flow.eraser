@@ -1,0 +1,61 @@
+// Eraser diagram type: Flow Chart
+direction down
+colorMode pastel
+styleMode shadow
+typeface clean
+
+Job received [shape: oval, icon: play, color: green]
+Open CSV as a stream [icon: file-text]
+Skip rows up to checkpoint_row [icon: skip-forward]
+Take next 10k rows [icon: layers]
+Keep only mapped columns [icon: filter]
+Split chunk across process pool [icon: cpu]
+
+Per row validation [icon: check-circle, color: blue] {
+  Next phone column by priority [icon: list]
+  Value empty [shape: diamond]
+  Excel scientific notation [shape: diamond]
+  Strip non digits [icon: scissors]
+  Fast regex matches India mobile [shape: diamond, icon: zap]
+  phonenumbers says valid [shape: diamond, icon: search]
+  Landline and rule enabled [shape: diamond, icon: phone-off]
+  Remember first reason [icon: bookmark]
+  More phone columns [shape: diamond]
+  Valid E164 number [shape: oval, icon: check, color: green]
+  Rejected with reason [shape: oval, icon: x, color: red]
+}
+
+Valid rows batch [icon: check-square, color: green]
+Rejected rows batch [icon: x-square, color: red]
+Save chunk in one transaction [icon: database, color: purple]
+More rows in file [shape: diamond]
+Mark import done [shape: oval, icon: flag, color: green]
+
+Job received > Open CSV as a stream
+Open CSV as a stream > Skip rows up to checkpoint_row
+Skip rows up to checkpoint_row > Take next 10k rows
+Take next 10k rows > Keep only mapped columns
+Keep only mapped columns > Split chunk across process pool
+Split chunk across process pool > Next phone column by priority
+Next phone column by priority > Value empty
+Value empty > More phone columns: yes
+Value empty > Excel scientific notation: no
+Excel scientific notation > Remember first reason: yes sci_notation
+Excel scientific notation > Strip non digits: no
+Strip non digits > Fast regex matches India mobile
+Fast regex matches India mobile > Landline and rule enabled: yes about 90 percent
+Fast regex matches India mobile > phonenumbers says valid: no
+phonenumbers says valid > Landline and rule enabled: yes
+phonenumbers says valid > Remember first reason: no invalid
+Landline and rule enabled > Remember first reason: yes landline
+Landline and rule enabled > Valid E164 number: no
+Remember first reason > More phone columns
+More phone columns > Next phone column by priority: yes
+More phone columns > Rejected with reason: no
+Valid E164 number > Valid rows batch
+Rejected with reason > Rejected rows batch
+Valid rows batch > Save chunk in one transaction
+Rejected rows batch > Save chunk in one transaction
+Save chunk in one transaction > More rows in file
+More rows in file > Take next 10k rows: yes
+More rows in file > Mark import done: no

@@ -1,0 +1,37 @@
+// Eraser diagram type: Flow Chart
+direction right
+colorMode pastel
+styleMode shadow
+typeface clean
+
+User [shape: oval, icon: user]
+
+Progress [icon: activity, color: blue] {
+  Poll import every 1 to 2 seconds [icon: refresh-cw]
+  Read counters from imports row [icon: hash]
+  Read new import_events [icon: list]
+}
+
+Browse [icon: table, color: green] {
+  Keyset page where id after cursor [icon: chevrons-right]
+  50 contacts per page [icon: users]
+}
+
+Export [icon: download, color: purple] {
+  COPY contacts TO STDOUT [icon: database]
+  COPY import_errors TO STDOUT [icon: x-circle]
+  Stream CSV to browser [icon: download-cloud]
+}
+
+Calling layer [shape: oval, icon: phone, color: gray]
+
+User > Poll import every 1 to 2 seconds
+Poll import every 1 to 2 seconds > Read counters from imports row: no COUNT star
+Poll import every 1 to 2 seconds > Read new import_events
+User > Keyset page where id after cursor: no OFFSET
+Keyset page where id after cursor > 50 contacts per page
+User > COPY contacts TO STDOUT
+User > COPY import_errors TO STDOUT: rejected rows
+COPY contacts TO STDOUT > Stream CSV to browser
+COPY import_errors TO STDOUT > Stream CSV to browser
+50 contacts per page > Calling layer: status pending

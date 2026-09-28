@@ -1,0 +1,79 @@
+// Eraser diagram type: Entity Relationship Diagram
+colorMode pastel
+styleMode shadow
+typeface clean
+
+// Owned by the host app
+campaigns [icon: flag, color: gray] {
+  id bigint pk
+}
+
+// One row per uploaded file. Also the job queue when Postgres is the queue.
+// UNIQUE (campaign_id, file_sha256) makes re-upload idempotent
+imports [icon: upload, color: blue] {
+  id bigserial pk
+  campaign_id bigint
+  file_path text
+  file_name text
+  file_sha256 text
+  file_size bigint
+  est_rows int
+  status text
+  mapping jsonb
+  default_region text
+  checkpoint_row int
+  valid_rows int
+  invalid_rows int
+  duplicate_rows int
+  reject_reasons jsonb
+  worker_id text
+  locked_at timestamptz
+  error text
+  created_at timestamptz
+  started_at timestamptz
+  finished_at timestamptz
+}
+
+// UNIQUE (campaign_id, phone_e164) enforces dedupe
+// INDEX (campaign_id, status, id) serves keyset pages and the calling layer
+contacts [icon: users, color: green] {
+  id bigserial pk
+  campaign_id bigint
+  import_id bigint
+  phone_e164 text
+  name text
+  vars jsonb
+  status text
+  created_at timestamptz
+}
+
+// Primary key (import_id, row_no). Kept after raw CSV retention for the rejected rows download
+import_errors [icon: x-circle, color: red] {
+  import_id bigint pk
+  row_no int pk
+  raw_phone text
+  reason text
+}
+
+// One row per committed chunk, written in the same transaction. Feeds the progress UI
+import_events [icon: activity, color: orange] {
+  id bigserial pk
+  import_id bigint
+  kind text
+  data jsonb
+  at timestamptz
+}
+
+// Temp table per worker connection, ON COMMIT DELETE ROWS
+stage_temp [icon: layers, color: gray] {
+  row_no int
+  phone_e164 text
+  name text
+  vars jsonb
+}
+
+imports.campaign_id > campaigns.id
+contacts.campaign_id > campaigns.id
+contacts.import_id > imports.id
+import_errors.import_id > imports.id
+import_events.import_id > imports.id

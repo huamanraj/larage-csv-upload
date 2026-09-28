@@ -1,0 +1,45 @@
+// Eraser diagram type: Cloud Architecture
+direction right
+colorMode pastel
+styleMode shadow
+typeface clean
+
+API [icon: fastapi, color: blue]
+
+JobQueue interface [icon: git-merge, color: orange] {
+  enqueue job [icon: log-in]
+  receive job [icon: log-out]
+  extend lease [icon: clock]
+  ack or retry [icon: check]
+}
+
+Queue backends [icon: shuffle] {
+  Postgres option [icon: postgres] {
+    UPDATE with FOR UPDATE SKIP LOCKED [icon: lock]
+  }
+  Celery option [icon: redis] {
+    acks_late and visibility timeout [icon: repeat]
+  }
+  SQS option [icon: aws-sqs] {
+    visibility timeout and DLQ [icon: inbox]
+  }
+  Kafka option [icon: kafka] {
+    consumer group and manual commit [icon: git-commit]
+  }
+}
+
+Worker [icon: cpu, color: purple]
+
+Correctness in Postgres [icon: postgres, color: green] {
+  worker_id lease [icon: key]
+  checkpoint_row [icon: bookmark]
+  status and counters [icon: flag]
+}
+
+API > enqueue job: import_id only
+enqueue job > Queue backends
+Queue backends > receive job: at-least-once delivery
+receive job > Worker
+Worker > extend lease: every chunk
+Worker > ack or retry: after done or failed
+Worker > Correctness in Postgres: guard + checkpoint in same transaction

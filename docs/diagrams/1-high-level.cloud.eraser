@@ -1,0 +1,50 @@
+// Eraser diagram type: Cloud Architecture
+direction right
+colorMode pastel
+styleMode shadow
+typeface clean
+
+User [icon: user]
+
+App server [icon: server, color: blue] {
+  API [icon: fastapi]
+  File storage [icon: hard-drive]
+}
+
+Job queue [icon: shuffle, color: orange] {
+  Postgres SKIP LOCKED [icon: postgres]
+  Celery with Redis [icon: redis]
+  AWS SQS [icon: aws-sqs]
+  Kafka topic [icon: kafka]
+}
+
+Import workers [icon: cpu, color: purple] {
+  Chunk reader [icon: layers]
+  Validator pool [icon: check-circle]
+  Chunk writer [icon: save]
+}
+
+Database [icon: postgres, color: green] {
+  imports [icon: list]
+  contacts [icon: users]
+  import_errors [icon: x-circle]
+  import_events [icon: activity]
+}
+
+Calling layer [icon: phone, color: gray]
+
+User > API: upload / map / poll / export
+API > File storage: stream bytes + sha256
+API > imports: create job and set queued
+API > Job queue: enqueue import_id
+Job queue > Chunk reader: deliver job
+File storage > Chunk reader: stream file
+Chunk reader > Validator pool: 10k-row chunks
+Validator pool > Chunk writer: valid rows + rejects
+Chunk writer > contacts: COPY + merge
+Chunk writer > import_errors: COPY rejects
+Chunk writer > imports: checkpoint + counters
+Chunk writer > import_events: progress event
+API > imports: read progress counters
+API > contacts: keyset pages + CSV export
+contacts > Calling layer: status pending

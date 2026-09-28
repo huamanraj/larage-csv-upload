@@ -1,0 +1,45 @@
+// Eraser diagram type: Sequence Diagram
+colorMode pastel
+styleMode shadow
+typeface clean
+
+Queue [icon: shuffle, color: orange]
+Worker [icon: cpu, color: purple]
+Validator pool [icon: check-circle, color: blue]
+Postgres [icon: postgres, color: green]
+New worker [icon: cpu, color: gray]
+
+Queue > Worker: deliver import_id
+Worker > Postgres: claim job and set worker_id lease
+Postgres --> Worker: mapping + checkpoint_row
+
+loop [label: for each 10k-row chunk] {
+  Worker > Validator pool: validate rows in parallel
+  Validator pool --> Worker: valid rows + rejects + reason counts
+  Worker > Postgres: BEGIN with synchronous_commit off
+  Worker > Postgres: UPDATE imports lease where worker_id and checkpoint match
+  alt [label: 0 rows updated] {
+    Postgres --> Worker: lease lost to another worker
+    Worker > Postgres: ROLLBACK and stop
+  }
+  else [label: 1 row updated] {
+    Worker > Postgres: COPY valid rows into temp stage table
+    Worker > Postgres: COPY rejects into import_errors
+    Worker > Postgres: INSERT contacts from stage DISTINCT ON phone ON CONFLICT DO NOTHING
+    Postgres --> Worker: inserted count so duplicates = staged - inserted
+    Worker > Postgres: UPDATE imports checkpoint_row + counters
+    Worker > Postgres: INSERT import_events chunk progress
+    Worker > Postgres: COMMIT data and checkpoint together
+  }
+}
+
+Worker > Postgres: set status done
+Worker > Queue: ack
+
+opt [label: worker crashes mid chunk] {
+  Postgres > Postgres: open transaction rolls back so nothing half saved
+  Queue > New worker: redeliver after lease or visibility timeout
+  New worker > Postgres: claim stale job
+  Postgres --> New worker: checkpoint_row of last committed chunk
+  New worker > New worker: skip rows up to checkpoint and continue
+}

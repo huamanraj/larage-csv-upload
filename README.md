@@ -77,4 +77,4 @@ Postgres settings for the box (see `docker-compose.yml`): `shared_buffers` at ab
 
 ## Design docs
 
-The justification, downsides, alternatives and a debate guide for design review are in [`docs/`](docs/README.md).
+The justification, downsides, alternatives, a debate guide and Eraser architecture diagrams are in [`docs/`](docs/README.md) and [`docs/diagrams/`](docs/diagrams/README.md).

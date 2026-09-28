@@ -1,0 +1,52 @@
+// Eraser diagram type: Flow Chart
+direction right
+colorMode pastel
+styleMode shadow
+typeface clean
+
+User picks CSV [shape: oval, icon: user]
+Stream body to disk [icon: upload-cloud]
+Hash sha256 and count lines while streaming [icon: hash]
+Size over cap [shape: diamond, icon: alert-triangle]
+Reject with 413 [shape: oval, icon: x-circle, color: red]
+Same campaign and hash exists [shape: diamond, icon: copy]
+Return existing import_id [shape: oval, icon: corner-up-left, color: gray]
+Create import with status uploaded [icon: database]
+Return 202 with import_id [shape: oval, icon: check, color: green]
+
+Preview [icon: eye, color: blue] {
+  Read first 50 rows only [icon: file-text]
+  Header name match [icon: type]
+  Valid sample share [icon: percent]
+  Column score [icon: bar-chart-2]
+  Suggest phone order and name [icon: star]
+}
+
+Mapping [icon: sliders, color: purple] {
+  User sets phone priority list [icon: list]
+  User picks name column [icon: user-check]
+  User picks vars to keep [icon: tag]
+  User sets region and landline rule [icon: globe]
+}
+
+Set status queued and enqueue [shape: oval, icon: send, color: orange]
+
+User picks CSV > Stream body to disk
+Stream body to disk > Hash sha256 and count lines while streaming
+Hash sha256 and count lines while streaming > Size over cap
+Size over cap > Reject with 413: yes
+Size over cap > Same campaign and hash exists: no
+Same campaign and hash exists > Return existing import_id: yes
+Same campaign and hash exists > Create import with status uploaded: no
+Create import with status uploaded > Return 202 with import_id
+Return 202 with import_id > Read first 50 rows only
+Read first 50 rows only > Header name match
+Read first 50 rows only > Valid sample share
+Header name match > Column score: weight 0.4
+Valid sample share > Column score: weight 0.6
+Column score > Suggest phone order and name
+Suggest phone order and name > User sets phone priority list
+User sets phone priority list > User picks name column
+User picks name column > User picks vars to keep
+User picks vars to keep > User sets region and landline rule
+User sets region and landline rule > Set status queued and enqueue
