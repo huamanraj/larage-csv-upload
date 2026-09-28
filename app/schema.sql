@@ -20,6 +20,16 @@ CREATE TABLE IF NOT EXISTS imports (
   finished_at timestamptz,
   UNIQUE (campaign_id, file_sha256)          -- same file twice = same import
 );
+-- Upgrade tables created by earlier versions (CREATE TABLE IF NOT EXISTS never alters them).
+-- The row is now created before the file exists, so path and hash start out empty.
+ALTER TABLE imports ALTER COLUMN file_path DROP NOT NULL;
+ALTER TABLE imports ALTER COLUMN file_sha256 DROP NOT NULL;
+ALTER TABLE imports ALTER COLUMN status SET DEFAULT 'uploading';
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS file_name text;
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS file_size bigint NOT NULL DEFAULT 0;
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS est_rows int NOT NULL DEFAULT 0;
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS worker_id text;
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS started_at timestamptz;
 CREATE INDEX IF NOT EXISTS imports_queue_idx ON imports (status, created_at);
 
 CREATE TABLE IF NOT EXISTS contacts (
