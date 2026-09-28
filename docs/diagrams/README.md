@@ -4,6 +4,7 @@ Paste each file into [Eraser](https://app.eraser.io) using the diagram type name
 
 | File | Eraser diagram type | Shows |
 |---|---|---|
+| `0-poc-flow.flow.eraser` | Flow Chart | **The POC as built**: upload stream loop, Postgres queue, chunk loop |
 | `1-high-level.cloud.eraser` | Cloud Architecture | Whole system: user, API, storage, pluggable queue, workers, database, calling layer |
 | `2-upload-and-mapping.flow.eraser` | Flow Chart | Streaming upload, idempotency, preview scoring, mapping |
 | `3-pluggable-queue.cloud.eraser` | Cloud Architecture | Queue-agnostic interface: Postgres / Celery / SQS / Kafka |

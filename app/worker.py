@@ -1,4 +1,5 @@
-"""Import worker: claims queued imports from Postgres (SKIP LOCKED) and processes them in 10k-row chunks.
+"""Import worker: takes queued imports from Postgres (FOR UPDATE SKIP LOCKED), streams the CSV
+in 10k-row chunks, validates them in a process pool and saves each chunk in one transaction.
 
 Run as its own process:  python -m app.worker
 """
@@ -11,7 +12,6 @@ import socket
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
@@ -27,12 +27,12 @@ csv.field_size_limit(16 * 1024 * 1024)
 
 
 class LostLock(Exception):
-    """Another worker re-claimed this import (our lock went stale). Stop without touching it."""
+    """Another worker re-claimed this import after our lock went stale."""
 
 
+# Take the oldest queued import (or one whose worker died) without blocking on rows others hold.
 CLAIM_SQL = f"""
-UPDATE imports SET status='processing', locked_at=now(), worker_id=%(worker)s,
-       started_at=coalesce(started_at, now()), error=NULL
+UPDATE imports SET status='processing', locked_at=now(), worker_id=%(worker)s, started_at=coalesce(started_at, now())
 WHERE id = (SELECT id FROM imports
             WHERE status='queued'
                OR (status='processing' AND locked_at < now() - interval '{config.LOCK_TIMEOUT}')
@@ -40,33 +40,17 @@ WHERE id = (SELECT id FROM imports
 RETURNING *
 """
 
+# In-file duplicates: first row wins. Existing contacts: ON CONFLICT skips them.
 MERGE_SQL = """
 WITH ins AS (
   INSERT INTO contacts (campaign_id, import_id, phone_e164, name, vars)
   SELECT %(campaign)s::bigint, %(import)s::bigint, phone_e164, name, vars
-  FROM (SELECT DISTINCT ON (phone_e164) row_no, phone_e164, name, vars
-        FROM stage ORDER BY phone_e164, row_no) first_seen   -- in-file dupes: first row wins
-  ORDER BY row_no                                            -- keep file order in contacts.id
+  FROM (SELECT DISTINCT ON (phone_e164) * FROM stage ORDER BY phone_e164, row_no) first_seen
+  ORDER BY row_no
   ON CONFLICT (campaign_id, phone_e164) DO NOTHING
   RETURNING 1)
-SELECT count(*) FROM ins
+SELECT count(*) AS n FROM ins
 """
-
-
-def rss_mb() -> float:
-    try:
-        with open("/proc/self/statm") as f:
-            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576, 1)
-    except OSError:
-        import resource
-        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
-
-
-def connect() -> psycopg.Connection:
-    conn = psycopg.connect(config.DATABASE_URL, autocommit=True, row_factory=dict_row)
-    conn.execute("CREATE TEMP TABLE IF NOT EXISTS stage "
-                 "(row_no int, phone_e164 text, name text, vars jsonb) ON COMMIT DELETE ROWS")
-    return conn
 
 
 def event(cur, import_id, kind, data):
@@ -74,10 +58,16 @@ def event(cur, import_id, kind, data):
                 (import_id, kind, json.dumps(data)))
 
 
+def connect():
+    conn = psycopg.connect(config.DATABASE_URL, autocommit=True, row_factory=dict_row)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS stage "
+                 "(row_no int, phone_e164 text, name text, vars jsonb) ON COMMIT DELETE ROWS")
+    return conn
+
+
 def claim(conn):
     with conn.transaction(), conn.cursor() as cur:
-        # One claimer at a time, so the global concurrency check below can't race.
-        cur.execute("SELECT pg_advisory_xact_lock(7332)")
+        cur.execute("SELECT pg_advisory_xact_lock(7332)")  # serialize claims so the concurrency cap holds
         cur.execute(f"SELECT count(*) AS n FROM imports WHERE status='processing' "
                     f"AND locked_at >= now() - interval '{config.LOCK_TIMEOUT}'")
         if cur.fetchone()["n"] >= config.IMPORT_CONCURRENCY:
@@ -87,95 +77,62 @@ def claim(conn):
         if job:
             cur.execute("SELECT count(*) AS n FROM import_events WHERE import_id=%s AND kind='chunk'", (job["id"],))
             job["chunks_done"] = cur.fetchone()["n"]
-            event(cur, job["id"], "claimed", {"worker": WORKER_ID, "resume_from": job["checkpoint_row"],
-                                              "pool": config.POOL_SIZE, "chunk_size": config.CHUNK_SIZE})
+            event(cur, job["id"], "claimed", {"worker": WORKER_ID, "resume_from": job["checkpoint_row"]})
         return job
 
 
 class Job:
     def __init__(self, conn, pool, job):
         self.conn, self.pool, self.job = conn, pool, job
-        self.id = job["id"]
-        self.checkpoint = job["checkpoint_row"]
-        self.reasons = dict(job["reject_reasons"] or {})
-        self.n = job["chunks_done"]
-        m = job["mapping"]
-        self.phone_cols = m["phone_columns"]
-        self.name_col = m.get("name_column")
-        self.var_cols = m.get("var_columns") or []
-        self.region = job["default_region"]
-        self.reject_landline = bool(m.get("reject_landline"))
-        self.country_col = m.get("country_column")
-        self.infer_cc = m.get("infer_country_code", True)
+        self.id, self.checkpoint, self.n = job["id"], job["checkpoint_row"], job["chunks_done"]
 
     def run(self):
-        path = Path(self.job["file_path"])
-        if not path.exists():
-            raise RuntimeError("source file is gone (retention cleanup?)")
         t_start = time.monotonic()
-        # Streaming reader: memory is bounded by one chunk regardless of file size.
-        with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        with open(self.job["file_path"], newline="", encoding="utf-8-sig", errors="replace") as f:
             reader = csv.reader(f)
-            header = next(reader, None)
-            if not header:
-                raise RuntimeError("file has no header row")
-            pos = {}
-            for i, h in enumerate(header):
-                pos.setdefault(h, i)
-            try:
-                phone_idx = [pos[c] for c in self.phone_cols]
-                var_idx = [pos[c] for c in self.var_cols]
-            except KeyError as e:
-                raise RuntimeError(f"mapped column {e} not in file")
-            name_idx = pos.get(self.name_col) if self.name_col else None
-            country_idx = pos.get(self.country_col) if self.country_col else None
+            header = [h.strip().lower() for h in next(reader, [])]
+            col = {h: i for i, h in reversed(list(enumerate(header)))}  # first occurrence wins
+            if "phone" not in col:
+                raise RuntimeError("CSV must have a 'phone' column")
+            p, nm, ct = col["phone"], col.get("name"), col.get("country")
+            extra = [(h, i) for i, h in enumerate(header) if i not in (p, nm, ct) and h]
+            with self.conn.cursor() as cur:
+                event(cur, self.id, "opened", {"path": self.job["file_path"], "bytes": self.job["file_size"]})
 
-            def get(rec, i):
-                return rec[i] if i is not None and i < len(rec) else ""
+            def cell(rec, i):
+                return rec[i].strip() if i is not None and i < len(rec) else ""
 
             row_no, chunk, t_read = 0, [], time.monotonic()
-            for rec in reader:
+            for rec in reader:                            # streaming: one row in memory at a time
                 row_no += 1
-                if row_no <= self.checkpoint:  # already committed before a crash / restart
+                if row_no <= self.checkpoint or not rec:  # already saved before a restart
                     continue
-                if not rec:
-                    continue
-                chunk.append((row_no, tuple(get(rec, i) for i in phone_idx), get(rec, name_idx),
-                              tuple(get(rec, i) for i in var_idx), get(rec, country_idx)))
+                vars_json = json.dumps({h: cell(rec, i) for h, i in extra if cell(rec, i)}) if extra else None
+                chunk.append((row_no, cell(rec, p), cell(rec, nm), cell(rec, ct), vars_json))
                 if len(chunk) >= config.CHUNK_SIZE:
                     self.flush(chunk, row_no, time.monotonic() - t_read)
-                    chunk = []
                     if STOP.is_set():
                         return self.release()
-                    if config.CHUNK_DELAY_MS:
-                        STOP.wait(config.CHUNK_DELAY_MS / 1000)
-                    t_read = time.monotonic()
+                    chunk, t_read = [], time.monotonic()
             if chunk or row_no > self.checkpoint:
                 self.flush(chunk, row_no, time.monotonic() - t_read)
         self.finish(time.monotonic() - t_start)
 
     def flush(self, chunk, last_row, read_s):
+        # Validate: split the chunk across the process pool (cores - 1).
         t0 = time.monotonic()
-        # Validate across the process pool (cores - 1), split into even slices.
-        k = max(1, min(config.POOL_SIZE, len(chunk) // 500 or 1))
-        size = -(-len(chunk) // k) if chunk else 0
-        futures = [self.pool.submit(validate_batch, chunk[i:i + size], self.var_cols, self.region,
-                                    self.reject_landline, self.infer_cc)
-                   for i in range(0, len(chunk), size)] if chunk else []
-        ok, bad, fast, chunk_reasons = [], [], 0, {}
-        for fut in futures:
-            o, b, reasons, f_ = fut.result()
+        k = max(1, min(config.POOL_SIZE, len(chunk) // 1000))
+        size = -(-len(chunk) // k) if chunk else 1
+        ok, bad = [], []
+        for o, b in self.pool.map(validate_batch, [chunk[i:i + size] for i in range(0, len(chunk), size)],
+                                  [config.DEFAULT_REGION] * k):
             ok += o
             bad += b
-            fast += f_
-            for r, c in reasons.items():
-                chunk_reasons[r] = chunk_reasons.get(r, 0) + c
-        reasons_after = {r: self.reasons.get(r, 0) + chunk_reasons.get(r, 0) for r in {*self.reasons, *chunk_reasons}}
         t1 = time.monotonic()
 
+        # Save: one transaction for data + checkpoint, so a crash can never save a chunk twice.
         with self.conn.transaction(), self.conn.cursor() as cur:
-            cur.execute("SET LOCAL synchronous_commit = off")  # safe: checkpoint commits with the data
-            # Lock our import row first and prove we still own it at the expected checkpoint.
+            cur.execute("SET LOCAL synchronous_commit = off")
             cur.execute("UPDATE imports SET locked_at=now() WHERE id=%s AND worker_id=%s "
                         "AND status='processing' AND checkpoint_row=%s", (self.id, WORKER_ID, self.checkpoint))
             if cur.rowcount != 1:
@@ -183,54 +140,40 @@ class Job:
             with cur.copy("COPY stage (row_no, phone_e164, name, vars) FROM STDIN") as cp:
                 for r in ok:
                     cp.write_row(r)
-            t2 = time.monotonic()
             with cur.copy("COPY import_errors (import_id, row_no, raw_phone, reason) FROM STDIN") as cp:
                 for r in bad:
                     cp.write_row((self.id, *r))
-            t3 = time.monotonic()
             cur.execute(MERGE_SQL, {"campaign": self.job["campaign_id"], "import": self.id})
-            inserted = cur.fetchone()["count"]
-            t4 = time.monotonic()
-            dups = len(ok) - inserted
-            cur.execute("""UPDATE imports SET checkpoint_row=%s, locked_at=now(),
-                             valid_rows=valid_rows+%s, invalid_rows=invalid_rows+%s,
-                             duplicate_rows=duplicate_rows+%s, reject_reasons=%s
-                           WHERE id=%s""",
-                        (last_row, inserted, len(bad), dups, json.dumps(reasons_after), self.id))
+            inserted = cur.fetchone()["n"]
+            t2 = time.monotonic()
+            cur.execute("""UPDATE imports SET checkpoint_row=%s, locked_at=now(), valid_rows=valid_rows+%s,
+                             invalid_rows=invalid_rows+%s, duplicate_rows=duplicate_rows+%s WHERE id=%s""",
+                        (last_row, inserted, len(bad), len(ok) - inserted, self.id))
             self.n += 1
             ms = lambda s: round(s * 1000, 1)
             event(cur, self.id, "chunk", {
                 "n": self.n, "first_row": self.checkpoint + 1, "last_row": last_row, "rows": len(chunk),
-                "staged": len(ok), "inserted": inserted, "dups": dups, "rejected": len(bad), "reasons": chunk_reasons, "fast": fast,
-                "workers": len(futures), "read_ms": ms(read_s), "validate_ms": ms(t1 - t0), "copy_ms": ms(t2 - t1),
-                "errors_ms": ms(t3 - t2), "merge_ms": ms(t4 - t3), "rss_mb": rss_mb()})
-        commit_ms = round((time.monotonic() - t4) * 1000, 1)
-        self.checkpoint, self.reasons = last_row, reasons_after
-        log.info("import %s chunk %s rows<=%s +%s dup=%s bad=%s commit=%sms",
-                 self.id, self.n, last_row, inserted, dups, len(bad), commit_ms)
+                "valid": len(ok), "invalid": len(bad), "inserted": inserted, "dups": len(ok) - inserted,
+                "read_ms": ms(read_s), "validate_ms": ms(t1 - t0), "save_ms": ms(t2 - t1),
+                "progress_ms": ms(time.monotonic() - t2)})
+        self.checkpoint = last_row
 
     def finish(self, elapsed):
         with self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute("""UPDATE imports SET status='done', finished_at=now(), locked_at=NULL
                            WHERE id=%s AND worker_id=%s AND status='processing'
-                           RETURNING checkpoint_row, valid_rows, invalid_rows, duplicate_rows""",
-                        (self.id, WORKER_ID))
+                           RETURNING checkpoint_row, valid_rows, invalid_rows, duplicate_rows""", (self.id, WORKER_ID))
             row = cur.fetchone()
             if not row:
                 raise LostLock()
             event(cur, self.id, "done", {**row, "seconds": round(elapsed, 2)})
-        if row["checkpoint_row"] >= config.ANALYZE_AFTER_ROWS:
-            t = time.monotonic()
-            self.conn.execute("ANALYZE contacts")
-            with self.conn.cursor() as cur:
-                event(cur, self.id, "analyze", {"ms": round((time.monotonic() - t) * 1000, 1)})
 
     def release(self):
-        """Graceful shutdown: hand the job back to the queue; the checkpoint makes the resume exact."""
+        """Graceful stop: put the job back in the queue; the checkpoint makes the resume exact."""
         with self.conn.transaction(), self.conn.cursor() as cur:
-            cur.execute("UPDATE imports SET status='queued', locked_at=NULL, worker_id=NULL "
-                        "WHERE id=%s AND worker_id=%s", (self.id, WORKER_ID))
-            event(cur, self.id, "released", {"checkpoint_row": self.checkpoint, "worker": WORKER_ID})
+            cur.execute("UPDATE imports SET status='queued', locked_at=NULL, worker_id=NULL WHERE id=%s AND worker_id=%s",
+                        (self.id, WORKER_ID))
+            event(cur, self.id, "released", {"checkpoint_row": self.checkpoint})
 
 
 def fail(conn, job_id, err):
@@ -240,7 +183,7 @@ def fail(conn, job_id, err):
         event(cur, job_id, "failed", {"error": err[:500]})
 
 
-def slot_loop(slot, pool):
+def slot_loop(pool):
     conn = None
     while not STOP.is_set():
         try:
@@ -248,41 +191,22 @@ def slot_loop(slot, pool):
                 conn = connect()
             job = claim(conn)
             if not job:
-                STOP.wait(1.0)
+                STOP.wait(0.5)
                 continue
-            log.info("slot %s claimed import %s (resume from row %s)", slot, job["id"], job["checkpoint_row"])
+            log.info("claimed import %s (resume from row %s)", job["id"], job["checkpoint_row"])
             try:
                 Job(conn, pool, job).run()
             except LostLock:
-                log.warning("import %s: lock lost to another worker, abandoning", job["id"])
+                log.warning("import %s: lock lost to another worker", job["id"])
             except psycopg.OperationalError:
-                raise  # connection trouble: the stale lock lets it be re-claimed
+                raise
             except Exception as e:  # noqa: BLE001
                 log.exception("import %s failed", job["id"])
                 fail(conn, job["id"], f"{type(e).__name__}: {e}")
         except psycopg.OperationalError as e:
             log.warning("db connection problem: %s", e)
-            try:
-                conn and conn.close()
-            except Exception:  # noqa: BLE001
-                pass
             conn = None
             STOP.wait(2.0)
-
-
-def retention_loop():
-    """Delete raw CSVs of finished imports after RETENTION_DAYS; import_errors stay for the rejected-rows CSV."""
-    while not STOP.is_set():
-        try:
-            with psycopg.connect(config.DATABASE_URL, autocommit=True) as conn:
-                rows = conn.execute("SELECT file_path FROM imports WHERE status IN ('done','failed') "
-                                    "AND finished_at < now() - make_interval(days => %s)",
-                                    (config.RETENTION_DAYS,)).fetchall()
-            for (p,) in rows:
-                Path(p).unlink(missing_ok=True)
-        except Exception as e:  # noqa: BLE001
-            log.warning("retention sweep failed: %s", e)
-        STOP.wait(3600)
 
 
 def main():
@@ -294,15 +218,14 @@ def main():
              WORKER_ID, config.IMPORT_CONCURRENCY, config.POOL_SIZE, config.CHUNK_SIZE)
     with ProcessPoolExecutor(config.POOL_SIZE, initializer=signal.signal,
                              initargs=(signal.SIGINT, signal.SIG_IGN)) as pool:
-        pool.submit(int).result()  # spawn the pool up front
-        threads = [threading.Thread(target=slot_loop, args=(i, pool), daemon=True)
-                   for i in range(config.IMPORT_CONCURRENCY)]
-        threads.append(threading.Thread(target=retention_loop, daemon=True))
+        pool.submit(int).result()  # start the pool before any threads
+        threads = [threading.Thread(target=slot_loop, args=(pool,), daemon=True)
+                   for _ in range(config.IMPORT_CONCURRENCY)]
         for t in threads:
             t.start()
         while not STOP.is_set():
             STOP.wait(1.0)
-        for t in threads[:-1]:
+        for t in threads:
             t.join(timeout=60)
     log.info("worker stopped")
 

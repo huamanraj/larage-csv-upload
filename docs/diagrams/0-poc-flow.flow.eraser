@@ -1,0 +1,52 @@
+// Eraser diagram type: Flow Chart. Matches the POC exactly (local storage, Postgres as the queue).
+direction down
+colorMode pastel
+styleMode shadow
+typeface clean
+
+User uploads CSV [shape: oval, icon: user, color: blue]
+Create import row [icon: database, label: "Create import row (status uploading)"]
+
+Upload stream loop [icon: repeat, color: blue] {
+  Receive piece [icon: download, label: "Receive next piece of file"]
+  Write piece [icon: hard-drive, label: "Write piece to local storage"]
+  Update hash [icon: hash, label: "Update sha256 hash"]
+  More bytes [shape: diamond, label: "More bytes?"]
+}
+
+Mark queued [icon: flag, label: "Import row status queued"]
+
+Job queue [icon: shuffle, color: orange] {
+  Push import_id [icon: send, label: "Push import_id (Postgres, FOR UPDATE SKIP LOCKED)"]
+}
+
+Worker picks job [icon: cpu, color: purple, label: "Worker picks up import_id"]
+Open file stream [icon: file-text, label: "Open file as a stream"]
+
+Chunk loop [icon: repeat, color: green] {
+  Read chunk [icon: layers, label: "Read next 10k rows"]
+  Validate rows [icon: check-circle, label: "Validate rows"]
+  Save chunk [icon: database, label: "Save chunk to contacts table"]
+  Update progress [icon: activity, label: "Save checkpoint and progress in import row"]
+  More rows [shape: diamond, label: "More rows?"]
+}
+
+Done [shape: oval, icon: check, color: green, label: "Import row status done"]
+
+User uploads CSV > Create import row
+Create import row > Receive piece
+Receive piece > Write piece
+Write piece > Update hash
+Update hash > More bytes
+More bytes > Receive piece: yes
+More bytes > Mark queued: no
+Mark queued > Push import_id
+Push import_id > Worker picks job
+Worker picks job > Open file stream
+Open file stream > Read chunk
+Read chunk > Validate rows
+Validate rows > Save chunk
+Save chunk > Update progress
+Update progress > More rows
+More rows > Read chunk: yes
+More rows > Done: no

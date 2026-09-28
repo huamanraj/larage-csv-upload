@@ -7,8 +7,7 @@ x-app: &app
     MAX_UPLOAD_MB: "300"
     CHUNK_SIZE: "10000"
     IMPORT_CONCURRENCY: "1"      # global cap on running imports
-    RETENTION_DAYS: "7"
-    CHUNK_DELAY_MS: "0"          # >0 only to slow a demo down
+    DEFAULT_REGION: "IN"         # country for numbers without a country code and no `country` value
   volumes:
     - imports:/data/imports
   depends_on:
