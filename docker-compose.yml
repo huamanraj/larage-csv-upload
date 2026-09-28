@@ -1,0 +1,47 @@
+# One box: api (uvicorn) + worker (own process, small process pool) + Postgres. No Redis/Celery.
+x-app: &app
+  build: .
+  environment:
+    DATABASE_URL: postgresql://postgres:postgres@db:5432/csvimport
+    DATA_DIR: /data/imports
+    MAX_UPLOAD_MB: "300"
+    CHUNK_SIZE: "10000"
+    IMPORT_CONCURRENCY: "1"      # global cap on running imports
+    RETENTION_DAYS: "7"
+    CHUNK_DELAY_MS: "0"          # >0 only to slow a demo down
+  volumes:
+    - imports:/data/imports
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: csvimport
+    # shared_buffers ~25% of RAM (set for a 4 GB box); max_wal_size 4GB so bulk COPY doesn't force constant checkpoints.
+    command: postgres -c shared_buffers=1GB -c max_wal_size=4GB -c checkpoint_timeout=15min
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d csvimport"]
+      interval: 2s
+      retries: 30
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    stop_grace_period: 60s       # lets the current chunk commit and the job go back to the queue
+
+volumes:
+  pgdata:
+  imports:

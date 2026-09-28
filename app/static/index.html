@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contacts import</title>
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell">
+  <div class="top">
+    <label class="field"><span>campaign</span><input id="campaign" type="number" min="1" value="1"></label>
+    <div class="crumb" id="crumb"></div>
+    <div class="grow"></div>
+    <button class="btn ghost hidden" id="newBtn"><span class="k">+</span> new upload</button>
+  </div>
+
+  <section class="rail" id="rail">
+    <div class="st" data-s="upload"><div class="idx">01 <i class="dot"></i></div><div class="nm">upload</div><div class="ds">streamed to disk, sha256 on the fly</div><div class="mt"></div><i class="bar"></i></div>
+    <div class="st" data-s="map"><div class="idx">02 <i class="dot"></i></div><div class="nm">map</div><div class="ds">phone priority, name, prompt vars</div><div class="mt"></div><i class="bar"></i></div>
+    <div class="st" data-s="queue"><div class="idx">03 <i class="dot"></i></div><div class="nm">queue</div><div class="ds">postgres row, status = queued</div><div class="mt"></div><i class="bar"></i></div>
+    <div class="st" data-s="claim"><div class="idx">04 <i class="dot"></i></div><div class="nm">claim</div><div class="ds">FOR UPDATE SKIP LOCKED + heartbeat</div><div class="mt"></div><i class="bar"></i></div>
+    <div class="st" data-s="process"><div class="idx">05 <i class="dot"></i></div><div class="nm">process</div><div class="ds">chunks, one transaction each</div><div class="mt"></div><i class="bar"></i></div>
+    <div class="st" data-s="fetch"><div class="idx">06 <i class="dot"></i></div><div class="nm">fetch</div><div class="ds">keyset pages, streamed export</div><div class="mt"></div><i class="bar"></i></div>
+  </section>
+
+  <!-- idle / uploading -->
+  <section class="view" id="v-idle">
+    <div class="cols">
+      <div class="drop" id="drop">
+        <input type="file" id="file" accept=".csv,text/csv" hidden>
+        <div class="drop-in">
+          <div class="drop-mark"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1"><path d="M8 11V2.5M4.5 6 8 2.5 11.5 6M2.5 10.5v3h11v-3"/></svg></div>
+          <div class="drop-t">drop a csv</div>
+          <div class="drop-s" id="dropHint">or click to choose</div>
+        </div>
+        <div class="up">
+          <div class="up-row"><div class="up-name" id="upName"></div><div class="mono muted" id="upPct">0%</div></div>
+          <div class="track" id="upTrack"><i id="upBar"></i></div>
+          <dl class="kv">
+            <dt>received</dt><dd id="upBytes">0 B</dd>
+            <dt>rate</dt><dd id="upRate">–</dd>
+            <dt>sha256</dt><dd class="sha" id="upSha">computing while streaming</dd>
+            <dt>rows</dt><dd id="upRows">–</dd>
+          </dl>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="ph">recent<div class="grow"></div><span class="v" id="recentCount"></span></div>
+        <div class="recent" id="recent"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- mapping -->
+  <section class="view" id="v-map">
+    <div class="cols">
+      <div class="panel">
+        <div class="ph">columns <span class="v" id="colCount"></span><div class="grow"></div><input class="filter" id="colFilter" placeholder="filter" autocomplete="off"></div>
+        <div class="clist" id="clist"></div>
+      </div>
+      <div class="panel">
+        <div class="msec">
+          <div class="mlab">phone priority <em>first valid wins</em></div>
+          <div class="pri" id="pri"></div>
+        </div>
+        <div class="msec">
+          <div class="mlab">name</div>
+          <div class="tags" id="nameTag"></div>
+        </div>
+        <div class="msec">
+          <div class="mlab">vars <em>kept as jsonb</em></div>
+          <div class="tags" id="varTags"></div>
+        </div>
+        <div class="msec opts">
+          <label class="field"><span>region</span><select id="region"><option>IN</option><option>US</option><option>GB</option><option>AE</option><option>SG</option><option>AU</option></select></label>
+          <label class="sw"><input type="checkbox" id="landline"><i></i>reject landlines</label>
+        </div>
+        <div class="go"><button class="btn primary" id="startBtn" disabled>start import</button></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- queued / processing / done -->
+  <section class="view" id="v-run">
+    <div class="cols">
+      <div class="stack">
+        <div class="panel">
+          <div class="ph">chunks <span class="v" id="chunkMeta"></span><div class="grow"></div><span class="v" id="chunkCount"></span></div>
+          <div class="cgrid" id="cgrid"></div>
+          <div id="errSlot"></div>
+        </div>
+        <div class="panel">
+          <div class="ph">per-chunk transaction<div class="grow"></div><span class="v" id="laneChunk"></span></div>
+          <div class="lane" id="lane">
+            <div class="ls" data-k="read"><div class="n">read <span class="arrow">→</span></div><div class="d">streaming csv reader</div><div class="v">–</div><div class="s">&nbsp;</div><i class="t"></i></div>
+            <div class="ls" data-k="validate"><div class="n">validate <span class="arrow">→</span></div><div class="d">regex fast path, phonenumbers fallback</div><div class="v">–</div><div class="s">&nbsp;</div><i class="t"></i></div>
+            <div class="ls" data-k="copy"><div class="n">COPY stage <span class="arrow">→</span></div><div class="d">temp table, delete on commit</div><div class="v">–</div><div class="s">&nbsp;</div><i class="t"></i></div>
+            <div class="ls" data-k="errors"><div class="n">COPY errors <span class="arrow">→</span></div><div class="d">import_errors with reason</div><div class="v">–</div><div class="s">&nbsp;</div><i class="t"></i></div>
+            <div class="ls" data-k="merge"><div class="n">merge <span class="arrow">→</span></div><div class="d">DISTINCT ON + ON CONFLICT DO NOTHING</div><div class="v">–</div><div class="s">&nbsp;</div><i class="t"></i></div>
+            <div class="ls" data-k="checkpoint"><div class="n">checkpoint</div><div class="d">committed with the data</div><div class="v">–</div><div class="s">&nbsp;</div><i class="t"></i></div>
+          </div>
+        </div>
+        <div class="spark-row">
+          <div class="panel"><div class="ph">throughput <span class="v">rows/s per chunk</span></div><div class="spark" id="spRate"></div></div>
+          <div class="panel"><div class="ph">worker memory <span class="v">rss per chunk</span></div><div class="spark" id="spRss"></div></div>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="panel">
+          <div class="pb">
+            <div class="big"><span class="num" id="cRows">0</span><span class="of" id="cOf"></span><span class="pct" id="cPct"></span></div>
+            <div class="stackbar"><i class="a" id="sbA"></i><i class="b" id="sbB"></i><i class="c" id="sbC"></i></div>
+          </div>
+          <div class="trio">
+            <div><div class="l"><i style="background:var(--ok)"></i>new</div><div class="v" id="cOk">0</div></div>
+            <div><div class="l"><i style="background:var(--dup)"></i>duplicate</div><div class="v" id="cDup">0</div></div>
+            <div><div class="l"><i style="background:var(--bad)"></i>rejected</div><div class="v" id="cBad">0</div></div>
+          </div>
+          <div class="meta">
+            <div><div class="l">elapsed</div><div class="v" id="mEl">–</div></div>
+            <div><div class="l">avg rows/s</div><div class="v" id="mRate">–</div></div>
+            <div><div class="l">fast path</div><div class="v" id="mFast">–</div></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="ph">rejections</div>
+          <div class="pb reasons" id="reasons"></div>
+        </div>
+        <div class="panel">
+          <div class="ph">log<div class="grow"></div><span class="v" id="worker"></span></div>
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel results hidden" id="results">
+      <div class="ph" style="padding-left:0">
+        <div class="tabs"><button class="tab on" data-t="contacts">contacts</button><button class="tab" data-t="errors">rejected rows</button></div>
+        <span class="v" id="resMeta"></span>
+        <div class="grow"></div>
+        <label class="field" id="statusField"><span>status</span><select id="statusSel"><option value="">all</option><option>pending</option></select></label>
+        <div class="pager"><button class="btn" id="prevBtn">←</button><button class="btn" id="nextBtn">→</button></div>
+        <a class="btn" id="exportBtn" href="#" download>export csv</a>
+      </div>
+      <div class="tbl-wrap"><table id="tbl"></table></div>
+    </div>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
