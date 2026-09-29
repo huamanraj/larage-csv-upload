@@ -202,12 +202,19 @@
       cpu: Math.max(0, ...segs.map(s => s.m?.cpu || 0)), rss: Math.max(0, ...segs.map(s => s.m?.rss || 0)),
       wal: segs.reduce((a, s) => a + (s.wal || 0), 0),
     };
+    // Imports recorded before resource tracking existed have steps but no numbers.
+    S.noMetrics = segs.some(s => s.node === 'read') && !segs.some(s => s.m || s.wal != null);
   }
 
   function renderCharts(seg) {
     const cores = S.cores || S.cfg.cores || 1, pk = S.peaks || {};
     const m = seg?.m, db = seg?.db;
     const cpuEl = $('.rc[data-c="cpu"] .rv'), ramEl = $('.rc[data-c="ram"] .rv'), dbEl = $('.rc[data-c="db"] .rv');
+    if (S.noMetrics) {
+      const msg = 'not recorded for this import · upload a new file';
+      [cpuEl, ramEl, dbEl].forEach(el => { el.textContent = msg; el.title = 'This import ran before CPU/RAM tracking was added, or the worker could not read it.'; });
+      return;
+    }
     cpuEl.textContent = m ? `${m.who} ${m.cpu.toFixed(1)} / ${cores} cores` : (pk.cpu ? `peak ${pk.cpu.toFixed(1)} / ${cores} cores` : '');
     cpuEl.title = `peak ${(pk.cpu || 0).toFixed(2)} of ${cores} cores`;
     ramEl.textContent = m ? `${m.who} ${fmt(Math.round(m.rss))} MB` : (pk.rss ? `peak ${fmt(Math.round(pk.rss))} MB` : '');
