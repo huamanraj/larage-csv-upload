@@ -6,6 +6,7 @@ RULES
 - Run every command exactly as written. Paste the real output as evidence. Never guess or invent results.
 - If a step fails, retry it once. If it still fails, mark the test FAIL, save the error output, and continue with the next test.
 - Work in the repo folder unless a step says otherwise.
+- `ID` in a command is a placeholder. Replace it with the number from "import_id" in that test's upload response. Example: the response {"import_id":7,...} means `wait_done 7`.
 
 WHAT THE APP DOES (so you understand the results)
 - It has three containers: `api` (web server + UI on port 8000), `worker` (processes imports) and `db` (Postgres).
