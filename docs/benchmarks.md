@@ -77,6 +77,19 @@ Throughput is about 30k rows/s on 2 cores and about 36k rows/s on 4 cores. Time 
 - **No temp files:** the per-chunk sort fits in `work_mem`.
 - **Disk to budget per 1M-row import:** about 165 MB of table and index growth, about 300 MB of WAL (recycled), plus the uploaded CSV (about 50 MB, kept until reset or cleanup).
 
+## Database on another machine (RDS / managed Postgres)
+
+Measured by sending the worker's database traffic through a proxy that adds a fixed network delay (200k rows, 4 cores). The proxy with no delay adds nothing measurable: 5.02 s vs 4.91 s direct.
+
+| Round-trip time to the DB | Typical setup | 200k rows | DB time per chunk | vs same VM |
+|---|---|---|---|---|
+| ~0 ms | Postgres on the same VM | 4.91 s | 135 ms | – |
+| 1 ms | RDS in the same availability zone | 5.67 s | 169 ms | +15% |
+| 5 ms | RDS in another zone / nearby region | 6.48 s | 198 ms | +32% |
+| 20 ms | DB in a far region | 10.65 s | 370 ms | +117% |
+
+Each 10k-row chunk makes about 12 round trips (guard, COPY ×2, merge, checkpoint, event, WAL metrics, commit), so remote-DB cost ≈ **12 × RTT per 10k rows**. Keep the worker in the same zone as the database. Two of those round trips are only for the WAL metric, and could be dropped, or the statements pipelined, if latency matters.
+
 ## 8-core projection (how it's derived)
 
 Per chunk at 4 cores: read ≈ 65 ms (one process, doesn't scale) + validate ≈ 44 ms (3 parallel slices) + DB save ≈ 160 ms (Postgres, mostly one core). With 8 cores, validation runs in 7 slices, about 20 ms, saving about 24 ms per chunk (~9%). Read and save stay about the same. The API's and Postgres's memory are unchanged; the worker grows to about 180 MB (8 validation processes). Average CPU stays about 1.2–1.3 cores per import.
