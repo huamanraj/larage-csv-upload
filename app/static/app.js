@@ -55,6 +55,10 @@
       'Data and checkpoint commit together or not at all, so after a crash nothing is saved twice or lost.'],
     moreRows: ['More rows?', 'Loop until the end of the file; the worker lease is refreshed on every chunk.',
       'A fresh lease tells other workers this one is alive, so they do not take the job over.'],
+    cores: ['Core cap', 'Limits the worker to the first N CPU cores (Linux CPU affinity) and validates each chunk in N parallel slices. auto uses every core for the worker, validating in cores − 1 slices.',
+      'Run the same file at 1, 2, 4… cores to see how latency scales. Validation speeds up with more cores; reading and the database save do not. Postgres itself is not capped.'],
+    runs: ['Runs', 'Recent imports with their core cap, processing time and throughput. re-run processes a stored file again with the core cap selected above.',
+      'Each re-run goes into a fresh campaign, so every run does identical work (no duplicates from the previous run) and the times are directly comparable.'],
     res_cpu: ['CPU', 'Cores busy during each step: the API process while it receives the upload, then the worker plus its validation processes for each chunk\'s read, validate and save.',
       'Validation is the CPU-heavy part and spreads across cores − 1, so the API stays free. During save the worker mostly waits on the database, which shows as a dip here and a spike in DB writes.'],
     res_ram: ['RAM', 'Memory held by the API during upload, and by the worker with its validation processes during processing.',
@@ -66,7 +70,8 @@
   };
 
   const S = { id: null, events: [], lastEvent: 0, imp: null, segs: [], total: 0, t: 0, speed: 1, playing: false,
-    shown: -1, timer: null, cfg: { chunk_size: 10000 } };
+    shown: -1, timer: null, cfg: { chunk_size: 10000 }, cap: null, runsFor: null };
+  try { S.cap = JSON.parse(localStorage.getItem('coresCap')) || null; } catch (_) { /* private mode */ }
 
   async function api(url, opts) {
     const r = await fetch(url, opts);
@@ -95,13 +100,14 @@
     // m = resource usage during a segment: who (api | worker), cores used, RSS MB; wal = MB written by the DB.
     const use = (who, cpu, rss) => (cpu == null ? {} : { m: { who, cpu, rss } });
     const ev = S.events, at = e => new Date(e.at).getTime();
+    S.cores = null;
     let file = '', total = 0, chunksTotal = 1, prevAt = null;
 
     for (const e of ev) {
       const d = e.data || {};
       if (e.kind === 'created') {
         file = d.file_name; total = d.size;
-        push('user', MIN_EVENT, { user: `${file} · ${bytes(total)}` });
+        push('user', MIN_EVENT, { user: d.rerun_of ? `re-run of #${d.rerun_of} · ${file}` : `${file} · ${bytes(total)}` });
         push('create', MIN_EVENT, { create: `#${S.id} · status uploading` });
       } else if (e.kind === 'uploaded') {
         const samples = d.samples || [];
@@ -117,6 +123,7 @@
           push('hash', q, { hash: `sha256 ${h}…` }, m);
           push('moreBytes', q, { moreBytes: last ? 'no' : 'yes' }, m);
         }
+        if (d.rerun_of) push('write', MIN_EVENT, { write: `reusing stored ${d.path.split('/').pop()} · ${bytes(d.bytes)}` });
         st.loop = {};
         st.vals.hash = `sha256 ${d.sha256.slice(0, 16)}…`;
         chunksTotal = Math.max(1, Math.ceil(d.est_rows / S.cfg.chunk_size));
@@ -132,7 +139,9 @@
           push: `import_id ${S.id} · waited ${clock(wait)}`,
           pick: `${d.worker} · SKIP LOCKED${d.resume_from ? ` · resume after row ${fmt(d.resume_from)}` : ''}` });
       } else if (e.kind === 'opened') {
-        push('open', MIN_EVENT, { open: `${d.path.split('/').pop()} · ${bytes(d.bytes)}` });
+        if (d.cores_used) S.cores = d.cores_used;
+        const lim = d.cores_used ? (d.cap ? ` · capped to ${d.cores_used} of ${S.cfg.cpus || d.cores_used} cores` : ` · all ${d.cores_used} cores`) : '';
+        push('open', MIN_EVENT, { open: `${d.path.split('/').pop()} · ${bytes(d.bytes)}${lim}` });
       } else if (e.kind === 'chunk') {
         chunksTotal = Math.max(chunksTotal, d.n);
         st.loop = { chunk: `chunk ${d.n} / ${chunksTotal}` };
@@ -304,6 +313,7 @@
         S.shown = -1;
       }
       if (!finished()) S.timer = setTimeout(poll, 700);
+      else if (S.runsFor !== id) { S.runsFor = id; loadRuns(); }
     } catch (e) {
       if (id === S.id) S.timer = setTimeout(poll, 2000);
     }
@@ -311,6 +321,7 @@
 
   async function open(id) {
     S.id = id; S.events = []; S.lastEvent = 0; S.segs = []; S.total = 0; S.shown = -1; S.t = 0;
+    $$('#runsBody tr').forEach(tr => tr.classList.toggle('cur', Number(tr.dataset.id) === id));
     await poll();
     if (!S.imp) return;
     $('#dropT').textContent = `#${id} · ${S.imp.file_name}`;
@@ -329,7 +340,7 @@
     $('#dropT').textContent = file.name;
     $('#dropS').textContent = 'uploading…';
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/imports');
+    xhr.open('POST', `/api/imports${S.cap ? `?cores=${S.cap}` : ''}`);
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('Content-Type', 'text/csv');
     xhr.upload.onprogress = e => {
@@ -351,11 +362,47 @@
       }
       if (body.duplicate) toast(`same file already imported as #${body.import_id}`);
       location.hash = body.import_id;
+      loadRuns();
     };
     xhr.send(file);
   }
 
   // ---------------------------------------------------------------- wiring
+  // ---------------------------------------------------------------- core cap + runs
+  const CAPS = [null, 1, 2, 4, 6, 8];
+  function renderCoreSeg() {
+    const cpus = S.cfg.cpus || 64;
+    $('#coreSeg').innerHTML = CAPS.map(c => `<button type="button" data-c="${c ?? ''}" class="${(S.cap ?? null) === c ? 'on' : ''}"
+      ${c && c > cpus ? `disabled title="only ${cpus} CPUs available"` : ''}>${c ?? 'auto'}</button>`).join('');
+    $$('#runsBody .rr').forEach(b => { b.textContent = `re-run · ${S.cap ?? 'auto'}`; });
+  }
+
+  async function loadRuns() {
+    let rows = [];
+    try { rows = await api('/api/imports?limit=10'); } catch (_) { return; }
+    $('#runs').classList.toggle('hidden', !rows.length);
+    $('#runsBody').innerHTML = rows.map(r => {
+      const secs = r.seconds != null ? Number(r.seconds) : null;
+      const cores = r.cores ? `${r.cores_used ?? r.cores}` : `auto${r.cores_used ? ` (${r.cores_used})` : ''}`;
+      return `<tr data-id="${r.id}" class="${r.id === S.id ? 'cur' : ''}">
+        <td>${r.id}</td><td class="f" title="${esc(r.file_name)}">${esc(r.file_name || '')}</td>
+        <td class="n">${fmt(r.rows)}</td><td class="n">${cores}</td>
+        <td class="n t">${secs != null ? `${secs.toFixed(2)} s` : '–'}</td>
+        <td class="n">${secs ? fmt(Math.round(r.rows / secs)) : '–'}</td>
+        <td class="st-${esc(r.status)}">${esc(r.status)}</td>
+        <td>${r.status === 'done' ? `<button class="rr" type="button" data-rerun="${r.id}">re-run · ${S.cap ?? 'auto'}</button>` : ''}</td></tr>`;
+    }).join('');
+  }
+
+  async function rerun(id) {
+    try {
+      const r = await api(`/api/imports/${id}/rerun${S.cap ? `?cores=${S.cap}` : ''}`, { method: 'POST' });
+      toast(`re-running #${id} as #${r.import_id} on ${S.cap ? `${S.cap} core${S.cap > 1 ? 's' : ''}` : 'auto cores'}`);
+      location.hash = r.import_id;
+      loadRuns();
+    } catch (e) { toast(e.message, true); }
+  }
+
   function wireInfo() {
     const mk = key => {
       const b = document.createElement('button');
@@ -411,12 +458,28 @@
       $('#dropS').textContent = 'columns: phone, name, country · others kept as vars';
       drawCharts();
       toast(`database reset · ${r.files_removed} file(s) removed`);
+      loadRuns();
     } catch (e) { toast(e.message, true); }
     b.disabled = false;
   }
 
   function wire() {
     wireInfo();
+    renderCoreSeg();
+    $('#coreSeg').addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b || b.disabled) return;
+      S.cap = b.dataset.c ? Number(b.dataset.c) : null;
+      try { localStorage.setItem('coresCap', JSON.stringify(S.cap)); } catch (_) { /* private mode */ }
+      renderCoreSeg();
+    });
+    $('#runsBody').addEventListener('click', e => {
+      const b = e.target.closest('[data-rerun]');
+      if (b) { rerun(Number(b.dataset.rerun)); return; }
+      const tr = e.target.closest('tr[data-id]');
+      if (tr) location.hash = tr.dataset.id;
+    });
+    loadRuns();
     const rb = $('#resetBtn');
     rb.classList.toggle('hidden', S.cfg.allow_reset === false);
     rb.addEventListener('click', resetDb);

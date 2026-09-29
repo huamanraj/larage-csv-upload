@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS imports (
   valid_rows int NOT NULL DEFAULT 0,
   invalid_rows int NOT NULL DEFAULT 0,
   duplicate_rows int NOT NULL DEFAULT 0,
+  cores int,                                 -- CPU cap for this import (NULL = auto)
   worker_id text,
   locked_at timestamptz,
   error text,
@@ -30,6 +31,7 @@ ALTER TABLE imports ADD COLUMN IF NOT EXISTS file_size bigint NOT NULL DEFAULT 0
 ALTER TABLE imports ADD COLUMN IF NOT EXISTS est_rows int NOT NULL DEFAULT 0;
 ALTER TABLE imports ADD COLUMN IF NOT EXISTS worker_id text;
 ALTER TABLE imports ADD COLUMN IF NOT EXISTS started_at timestamptz;
+ALTER TABLE imports ADD COLUMN IF NOT EXISTS cores int;
 CREATE INDEX IF NOT EXISTS imports_queue_idx ON imports (status, created_at);
 
 CREATE TABLE IF NOT EXISTS contacts (

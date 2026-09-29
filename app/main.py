@@ -23,7 +23,7 @@ from psycopg_pool import AsyncConnectionPool
 from . import config
 from .columns import resolve
 from .db import init_schema
-from .metrics import CORES, RAM_TOTAL_MB, Usage
+from .metrics import ALLOWED_CPUS, CORES, RAM_TOTAL_MB, Usage
 
 STATIC = Path(__file__).parent / "static"
 SAMPLE_EVERY = 1 / 60  # record ~60 upload progress samples for the timeline
@@ -68,7 +68,7 @@ async def index():
 async def get_config():
     return {"chunk_size": config.CHUNK_SIZE, "max_upload_bytes": config.MAX_UPLOAD_BYTES,
             "default_region": config.DEFAULT_REGION, "cores": CORES, "ram_mb": RAM_TOTAL_MB,
-            "allow_reset": config.ALLOW_RESET}
+            "allow_reset": config.ALLOW_RESET, "cpus": len(ALLOWED_CPUS)}
 
 
 @app.post("/api/reset")
@@ -97,7 +97,7 @@ def read_header(path):
 
 
 @app.post("/api/imports", status_code=202)
-async def upload(request: Request, campaign_id: int = 1):
+async def upload(request: Request, campaign_id: int = 1, cores: int | None = Query(None, ge=1, le=256)):
     """1. create import row  2. stream body to local storage + sha256  3. mark queued (= push to the queue)."""
     size_hint = int(request.headers.get("content-length") or 0)
     if size_hint > config.MAX_UPLOAD_BYTES:
@@ -105,8 +105,8 @@ async def upload(request: Request, campaign_id: int = 1):
     name = unquote(request.headers.get("x-file-name", "upload.csv"))[:255]
 
     async with pool.connection() as conn:
-        cur = await conn.execute("INSERT INTO imports (campaign_id, file_name) VALUES (%s, %s) RETURNING id, created_at",
-                                 (campaign_id, name))
+        cur = await conn.execute("INSERT INTO imports (campaign_id, file_name, cores) VALUES (%s, %s, %s) "
+                                 "RETURNING id, created_at", (campaign_id, name, cores))
         row = await cur.fetchone()
         import_id = row["id"]
         await event(conn, import_id, "created", {"file_name": name, "size": size_hint})
@@ -167,6 +167,43 @@ async def upload(request: Request, campaign_id: int = 1):
                                                    "path": str(path), "samples": samples})
         await event(conn, import_id, "queued", {"import_id": import_id})
     return {"import_id": import_id, "duplicate": False}
+
+
+@app.get("/api/imports")
+async def list_imports(limit: int = Query(12, ge=1, le=100)):
+    """Recent imports with their core cap and timing, for comparing runs."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT id, campaign_id, file_name, status, cores, checkpoint_row AS rows, valid_rows, invalid_rows,
+                      duplicate_rows, round(extract(epoch FROM finished_at - started_at)::numeric, 2) AS seconds,
+                      (SELECT (data->>'cores_used')::int FROM import_events e
+                        WHERE e.import_id = i.id AND kind = 'opened' ORDER BY id DESC LIMIT 1) AS cores_used
+               FROM imports i ORDER BY id DESC LIMIT %s""", (limit,))
+        return await cur.fetchall()
+
+
+@app.post("/api/imports/{import_id}/rerun")
+async def rerun(import_id: int, cores: int | None = Query(None, ge=1, le=256)):
+    """Process an already uploaded file again, with a (different) core cap, into a fresh campaign so every
+    run does identical work (no duplicates carried over from the previous run)."""
+    async with pool.connection() as conn, conn.transaction():
+        cur = await conn.execute("SELECT * FROM imports WHERE id=%s", (import_id,))
+        src = await cur.fetchone()
+        if not src or not src["file_path"] or not Path(src["file_path"]).exists():
+            raise HTTPException(404, "original file not found (it may have been reset)")
+        cur = await conn.execute(
+            """INSERT INTO imports (campaign_id, file_name, file_path, file_sha256, file_size, est_rows, status, cores)
+               VALUES ((SELECT coalesce(max(campaign_id), 0) + 1 FROM imports), %s, %s, %s, %s, %s, 'queued', %s)
+               RETURNING id, campaign_id""",
+            (src["file_name"], src["file_path"], src["file_sha256"], src["file_size"], src["est_rows"], cores))
+        row = await cur.fetchone()
+        new_id = row["id"]
+        await event(conn, new_id, "created", {"file_name": src["file_name"], "size": src["file_size"], "rerun_of": import_id})
+        await event(conn, new_id, "uploaded", {"bytes": src["file_size"], "sha256": src["file_sha256"],
+                                               "est_rows": src["est_rows"], "path": src["file_path"], "samples": [],
+                                               "rerun_of": import_id})
+        await event(conn, new_id, "queued", {"import_id": new_id})
+    return {"import_id": new_id, "campaign_id": row["campaign_id"], "duplicate": False}
 
 
 @app.get("/api/imports/{import_id}")

@@ -12,12 +12,19 @@
 </head>
 <body>
 <main class="shell">
-  <label class="drop" id="drop">
-    <input type="file" id="file" accept=".csv,text/csv" hidden>
-    <span class="drop-t" id="dropT">drop a csv</span>
-    <span class="drop-s" id="dropS">columns: phone, name, country · others kept as vars</span>
-    <i class="drop-bar" id="dropBar"></i>
-  </label>
+  <div class="top">
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".csv,text/csv" hidden>
+      <span class="drop-t" id="dropT">drop a csv</span>
+      <span class="drop-s" id="dropS">columns: phone, name, country · others kept as vars</span>
+      <i class="drop-bar" id="dropBar"></i>
+    </label>
+    <div class="cores">
+      <span class="cl">cores</span>
+      <div class="seg" id="coreSeg"></div>
+      <button class="info" type="button" data-info="cores" aria-label="About: cores">i</button>
+    </div>
+  </div>
 
   <section class="flow">
     <div class="col">
@@ -87,6 +94,14 @@
       <input type="range" id="scrub" min="0" max="1000" value="0" step="1">
       <span class="time" id="time">0.0s / 0.0s</span>
     </div>
+  </section>
+
+  <section class="runs hidden" id="runs">
+    <div class="runs-h"><span>runs</span><button class="info" type="button" data-info="runs" aria-label="About: runs">i</button></div>
+    <div class="runs-w"><table>
+      <thead><tr><th>#</th><th>file</th><th class="n">rows</th><th class="n">cores</th><th class="n">time</th><th class="n">rows/s</th><th>status</th><th></th></tr></thead>
+      <tbody id="runsBody"></tbody>
+    </table></div>
   </section>
 </main>
 <div class="toast" id="toast"></div>

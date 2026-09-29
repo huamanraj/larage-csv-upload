@@ -65,6 +65,22 @@ Every step writes an `import_events` row. The UI polls `GET /api/imports/{id}` a
 
 The numbers are recorded in the events, so they replay and rewind with everything else. Postgres's own CPU and RAM are not charted, because the worker can't see the database container's processes. Use `docker stats` for that.
 
+**Core cap (latency benchmarking).** Pick **auto / 1 / 2 / 4 / 6 / 8** next to the drop zone before uploading, or press **re-run** in the runs table to process a stored file again with the selected cap.
+- **How the cap works:** the worker pins itself and its validation processes to the first N CPUs (Linux `sched_setaffinity`) and validates each chunk in N parallel slices. It gets all CPUs back after the import.
+- **Fair comparison:** each re-run goes into a fresh campaign, so every run does identical work. The runs table then shows time and rows/s per cap.
+- **What the cap covers:** only the worker. Postgres is not capped, so to limit the whole box, also set `cpus:` on the `db` service in `docker-compose.yml`.
+- **Where it applies:** the whole worker, so use it with `IMPORT_CONCURRENCY=1`. Under Docker Desktop, the maximum is the number of CPUs given to Docker's VM.
+
+Measured on 4 cores, 100k rows:
+
+| Cap | Mostly Indian numbers | All foreign numbers |
+|---|---|---|
+| 1 core | 3.2 s | 8.1 s |
+| 2 cores | 2.6 s | 4.7 s |
+| 4 cores | 2.4 s | 4.0 s |
+
+Extra cores mostly speed up validation. The reading and the database save stay about the same.
+
 Results can be paged with `GET /api/campaigns/{id}/contacts?after_id=` (keyset pagination, no `OFFSET`).
 
 ## Measured (4 cores, 3 validators)

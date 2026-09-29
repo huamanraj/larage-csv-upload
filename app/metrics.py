@@ -1,10 +1,34 @@
-"""CPU and memory of this process plus its children (the worker's validation pool)."""
+"""CPU and memory of this process plus its children (the worker's validation pool), and CPU pinning."""
+import os
 import time
 
 import psutil
 
 CORES = psutil.cpu_count() or 1
 RAM_TOTAL_MB = round(psutil.virtual_memory().total / 2**20)
+# CPUs this process may run on (a container can see fewer than the host has).
+ALLOWED_CPUS = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(CORES))
+
+
+def pin(pids, cpus):
+    """Restrict processes to the given CPU ids (Linux). Returns False where affinity isn't supported."""
+    if not hasattr(os, "sched_setaffinity"):
+        return False
+    ok = True
+    for pid in pids:
+        try:
+            os.sched_setaffinity(pid, cpus)
+        except OSError:  # process exited, or not permitted
+            ok = False
+    return ok
+
+
+def tree_pids():
+    """This process and all its children (the validation pool)."""
+    try:
+        return [os.getpid(), *(c.pid for c in psutil.Process().children(recursive=True))]
+    except psutil.Error:
+        return [os.getpid()]
 
 
 class Usage:

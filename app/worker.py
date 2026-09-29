@@ -19,7 +19,7 @@ from psycopg.rows import dict_row
 from . import config
 from .db import init_schema
 from .columns import resolve
-from .metrics import CORES, RAM_TOTAL_MB, Usage
+from .metrics import ALLOWED_CPUS, CORES, RAM_TOTAL_MB, Usage, pin, tree_pids
 from .phones import validate_batch
 
 log = logging.getLogger("worker")
@@ -88,8 +88,28 @@ class Job:
     def __init__(self, conn, pool, job):
         self.conn, self.pool, self.job = conn, pool, job
         self.id, self.checkpoint, self.n = job["id"], job["checkpoint_row"], job["chunks_done"]
+        self.slices = config.POOL_SIZE  # parallel validation slices per chunk
+
+    def limit_cores(self):
+        """Apply the import's core cap: pin the worker and its validation processes to the first N CPUs and
+        validate in N slices. The cap covers the whole worker (read + validate), not Postgres."""
+        cap = self.job.get("cores")
+        if not cap:
+            return {"cap": None, "cores_used": len(ALLOWED_CPUS), "slices": self.slices}
+        n = max(1, min(cap, len(ALLOWED_CPUS)))
+        self.slices = n
+        pinned = pin(tree_pids(), ALLOWED_CPUS[:n])
+        return {"cap": cap, "cores_used": n, "cpus": ALLOWED_CPUS[:n], "slices": n, "pinned": pinned}
 
     def run(self):
+        try:
+            self._run()
+        finally:
+            if self.job.get("cores"):
+                pin(tree_pids(), ALLOWED_CPUS)  # give the worker all CPUs back for the next import
+
+    def _run(self):
+        limits = self.limit_cores()
         t_start = time.monotonic()
         with open(self.job["file_path"], newline="", encoding="utf-8-sig", errors="replace") as f:
             reader = csv.reader(f)
@@ -98,7 +118,7 @@ class Job:
                 raise RuntimeError("no phone column found")
             phones, names, countries, extra = cols["phones"], cols["name"], cols["country"], cols["extra"]
             with self.conn.cursor() as cur:
-                event(cur, self.id, "opened", {"path": self.job["file_path"], "bytes": self.job["file_size"]})
+                event(cur, self.id, "opened", {"path": self.job["file_path"], "bytes": self.job["file_size"], **limits})
             self.usage = Usage()  # CPU and RAM of this worker + its validation processes
 
             def cell(rec, i):
@@ -126,7 +146,7 @@ class Job:
         cpu_read, _ = self.usage.tick()  # since the previous chunk: reading and parsing rows
         # Validate: split the chunk across the process pool (cores - 1).
         t0 = time.monotonic()
-        k = max(1, min(config.POOL_SIZE, len(chunk) // 1000))
+        k = max(1, min(self.slices, len(chunk) // 1000))
         size = -(-len(chunk) // k) if chunk else 1
         ok, bad = [], []
         for o, b in self.pool.map(validate_batch, [chunk[i:i + size] for i in range(0, len(chunk), size)],
@@ -226,9 +246,10 @@ def main():
     init_schema()
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
-    log.info("worker %s: %s slot(s), %s validation process(es), chunk %s",
-             WORKER_ID, config.IMPORT_CONCURRENCY, config.POOL_SIZE, config.CHUNK_SIZE)
-    with ProcessPoolExecutor(config.POOL_SIZE, initializer=signal.signal,
+    procs = max(config.POOL_SIZE, len(ALLOWED_CPUS))  # enough processes for a cap of every available CPU
+    log.info("worker %s: %s slot(s), %s validation process(es) (%s slices when uncapped), chunk %s",
+             WORKER_ID, config.IMPORT_CONCURRENCY, procs, config.POOL_SIZE, config.CHUNK_SIZE)
+    with ProcessPoolExecutor(procs, initializer=signal.signal,
                              initargs=(signal.SIGINT, signal.SIG_IGN)) as pool:
         pool.submit(int).result()  # start the pool before any threads
         threads = [threading.Thread(target=slot_loop, args=(pool,), daemon=True)
