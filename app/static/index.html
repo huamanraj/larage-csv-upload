@@ -61,6 +61,20 @@
 
   <section class="player" id="player">
     <div class="stats" id="stats"></div>
+    <div class="res" id="res">
+      <div class="rc" data-c="cpu">
+        <div class="rh"><span class="rl">CPU<i class="k api"></i>api<i class="k worker"></i>worker</span><span class="rv"></span><button class="info" type="button" data-info="res_cpu" aria-label="About: CPU">i</button></div>
+        <svg viewBox="0 0 1000 44" preserveAspectRatio="none"><g class="grid"><line x1="0" y1="43.5" x2="1000" y2="43.5"/><line x1="0" y1="22" x2="1000" y2="22"/></g><path class="api"/><path class="worker"/><path class="db"/><line class="cur" x1="0" y1="0" x2="0" y2="44"/></svg>
+      </div>
+      <div class="rc" data-c="ram">
+        <div class="rh"><span class="rl">RAM<i class="k api"></i>api<i class="k worker"></i>worker</span><span class="rv"></span><button class="info" type="button" data-info="res_ram" aria-label="About: RAM">i</button></div>
+        <svg viewBox="0 0 1000 44" preserveAspectRatio="none"><g class="grid"><line x1="0" y1="43.5" x2="1000" y2="43.5"/><line x1="0" y1="22" x2="1000" y2="22"/></g><path class="api"/><path class="worker"/><path class="db"/><line class="cur" x1="0" y1="0" x2="0" y2="44"/></svg>
+      </div>
+      <div class="rc" data-c="db">
+        <div class="rh"><span class="rl">DB writes<i class="k db"></i>WAL per chunk</span><span class="rv"></span><button class="info" type="button" data-info="res_db" aria-label="About: DB writes">i</button></div>
+        <svg viewBox="0 0 1000 44" preserveAspectRatio="none"><g class="grid"><line x1="0" y1="43.5" x2="1000" y2="43.5"/><line x1="0" y1="22" x2="1000" y2="22"/></g><path class="api"/><path class="worker"/><path class="db"/><line class="cur" x1="0" y1="0" x2="0" y2="44"/></svg>
+      </div>
+    </div>
     <div class="ctl">
       <button class="pb" id="playBtn" aria-label="play">
         <svg id="icPlay" width="12" height="12" viewBox="0 0 12 12"><path d="M3 1.5v9l7.5-4.5z" fill="currentColor"/></svg>

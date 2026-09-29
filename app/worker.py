@@ -19,6 +19,7 @@ from psycopg.rows import dict_row
 from . import config
 from .db import init_schema
 from .columns import resolve
+from .metrics import CORES, RAM_TOTAL_MB, Usage
 from .phones import validate_batch
 
 log = logging.getLogger("worker")
@@ -78,7 +79,8 @@ def claim(conn):
         if job:
             cur.execute("SELECT count(*) AS n FROM import_events WHERE import_id=%s AND kind='chunk'", (job["id"],))
             job["chunks_done"] = cur.fetchone()["n"]
-            event(cur, job["id"], "claimed", {"worker": WORKER_ID, "resume_from": job["checkpoint_row"]})
+            event(cur, job["id"], "claimed", {"worker": WORKER_ID, "resume_from": job["checkpoint_row"],
+                                              "cores": CORES, "ram_mb": RAM_TOTAL_MB})
         return job
 
 
@@ -97,6 +99,7 @@ class Job:
             phones, names, countries, extra = cols["phones"], cols["name"], cols["country"], cols["extra"]
             with self.conn.cursor() as cur:
                 event(cur, self.id, "opened", {"path": self.job["file_path"], "bytes": self.job["file_size"]})
+            self.usage = Usage()  # CPU and RAM of this worker + its validation processes
 
             def cell(rec, i):
                 return rec[i].strip() if i is not None and i < len(rec) else ""
@@ -120,6 +123,7 @@ class Job:
         self.finish(time.monotonic() - t_start)
 
     def flush(self, chunk, last_row, read_s):
+        cpu_read, _ = self.usage.tick()  # since the previous chunk: reading and parsing rows
         # Validate: split the chunk across the process pool (cores - 1).
         t0 = time.monotonic()
         k = max(1, min(config.POOL_SIZE, len(chunk) // 1000))
@@ -130,6 +134,7 @@ class Job:
             ok += o
             bad += b
         t1 = time.monotonic()
+        cpu_validate, rss_validate = self.usage.tick()
 
         # Save: one transaction for data + checkpoint, so a crash can never save a chunk twice.
         with self.conn.transaction(), self.conn.cursor() as cur:
@@ -138,6 +143,7 @@ class Job:
                         "AND status='processing' AND checkpoint_row=%s", (self.id, WORKER_ID, self.checkpoint))
             if cur.rowcount != 1:
                 raise LostLock()
+            wal0 = cur.execute("SELECT pg_current_wal_insert_lsn() AS l").fetchone()["l"]
             with cur.copy("COPY stage (row_no, phone_e164, name, vars) FROM STDIN") as cp:
                 for r in ok:
                     cp.write_row(r)
@@ -150,13 +156,18 @@ class Job:
             cur.execute("""UPDATE imports SET checkpoint_row=%s, locked_at=now(), valid_rows=valid_rows+%s,
                              invalid_rows=invalid_rows+%s, duplicate_rows=duplicate_rows+%s WHERE id=%s""",
                         (last_row, inserted, len(bad), len(ok) - inserted, self.id))
+            # WAL bytes this chunk made the database write (whole cluster; the import dominates).
+            wal = cur.execute("SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), %s) AS b", (wal0,)).fetchone()["b"]
+            cpu_save, rss_save = self.usage.tick()
             self.n += 1
             ms = lambda s: round(s * 1000, 1)
             event(cur, self.id, "chunk", {
                 "n": self.n, "first_row": self.checkpoint + 1, "last_row": last_row, "rows": len(chunk),
                 "valid": len(ok), "invalid": len(bad), "inserted": inserted, "dups": len(ok) - inserted,
                 "read_ms": ms(read_s), "validate_ms": ms(t1 - t0), "save_ms": ms(t2 - t1),
-                "progress_ms": ms(time.monotonic() - t2)})
+                "progress_ms": ms(time.monotonic() - t2),
+                "cpu_read": cpu_read, "cpu_validate": cpu_validate, "cpu_save": cpu_save,
+                "rss_mb": max(rss_validate, rss_save), "wal_mb": round(float(wal) / 2**20, 2)})
         self.checkpoint = last_row
 
     def finish(self, elapsed):

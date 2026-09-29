@@ -55,6 +55,16 @@ pip install -r requirements-dev.txt && python -m pytest tests
 
 Every step writes an `import_events` row. The UI polls `GET /api/imports/{id}` and turns those events into a timeline. Use **0.1×–5×** to slow it down or speed it up, and drag the bar (or press ←/→) to rewind. Press space to play or pause.
 
+**Resource charts.** Three charts under the flow follow the same timeline and cursor:
+
+- **CPU:** cores in use, measured with `psutil`.
+  - During upload, the API process.
+  - For each chunk, the worker plus its validation processes, split into read, validate and save.
+- **RAM:** memory held by the API during upload, and by the worker with its validation processes afterwards. It should stay flat whatever the file size.
+- **DB writes:** WAL bytes each chunk's transaction made Postgres write (`pg_current_wal_insert_lsn()` measured before and after), plus the time spent in the database. These are the database's per-chunk write spikes.
+
+The numbers are recorded in the events, so they replay and rewind with everything else. Postgres's own CPU and RAM are not charted, because the worker can't see the database container's processes. Use `docker stats` for that.
+
 Results can be paged with `GET /api/campaigns/{id}/contacts?after_id=` (keyset pagination, no `OFFSET`).
 
 ## Measured (4 cores, 3 validators)

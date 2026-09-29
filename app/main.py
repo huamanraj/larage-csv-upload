@@ -23,6 +23,7 @@ from psycopg_pool import AsyncConnectionPool
 from . import config
 from .columns import resolve
 from .db import init_schema
+from .metrics import CORES, RAM_TOTAL_MB, Usage
 
 STATIC = Path(__file__).parent / "static"
 SAMPLE_EVERY = 1 / 60  # record ~60 upload progress samples for the timeline
@@ -53,7 +54,7 @@ async def index():
 @app.get("/api/config")
 async def get_config():
     return {"chunk_size": config.CHUNK_SIZE, "max_upload_bytes": config.MAX_UPLOAD_BYTES,
-            "default_region": config.DEFAULT_REGION}
+            "default_region": config.DEFAULT_REGION, "cores": CORES, "ram_mb": RAM_TOTAL_MB}
 
 
 async def event(conn, import_id, kind, data, at=None):
@@ -83,7 +84,17 @@ async def upload(request: Request, campaign_id: int = 1):
 
     path = Path(config.DATA_DIR) / f"{import_id}.csv"
     h, size, newlines, last = hashlib.sha256(), 0, 0, b"\n"
-    samples, next_sample, t0 = [], 0, time.monotonic()
+    usage = Usage(min_window=0.1)  # CPU and RAM of this API process while it receives the upload
+    samples, pending, next_sample, t0 = [], [], 0, time.monotonic()
+
+    def sample(digest, force=False):
+        cores, rss = usage.tick(force)
+        samples.append([round((time.monotonic() - t0) * 1000, 1), size, digest, cores, rss])
+        pending.append(samples[-1])
+        if usage.measured:  # the CPU figure covers every sample since the last measurement
+            for s in pending:
+                s[3] = cores
+            pending.clear()
     try:
         with open(path, "wb") as f:
             async for piece in request.stream():         # receive next piece
@@ -97,9 +108,9 @@ async def upload(request: Request, campaign_id: int = 1):
                 newlines += piece.count(b"\n")
                 last = piece[-1:]
                 if size >= next_sample:
-                    samples.append([round((time.monotonic() - t0) * 1000, 1), size, h.copy().hexdigest()[:16]])
+                    sample(h.copy().hexdigest()[:16])
                     next_sample = size + max(65536, size_hint * SAMPLE_EVERY)
-        samples.append([round((time.monotonic() - t0) * 1000, 1), size, h.hexdigest()[:16]])
+        sample(h.hexdigest()[:16], force=True)
         if size == 0:
             raise HTTPException(400, "empty file")
         if not resolve(read_header(path))["phones"]:

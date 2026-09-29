@@ -55,6 +55,12 @@
       'Data and checkpoint commit together or not at all, so after a crash nothing is saved twice or lost.'],
     moreRows: ['More rows?', 'Loop until the end of the file; the worker lease is refreshed on every chunk.',
       'A fresh lease tells other workers this one is alive, so they do not take the job over.'],
+    res_cpu: ['CPU', 'Cores busy during each step: the API process while it receives the upload, then the worker plus its validation processes for each chunk\'s read, validate and save.',
+      'Validation is the CPU-heavy part and spreads across cores − 1, so the API stays free. During save the worker mostly waits on the database, which shows as a dip here and a spike in DB writes.'],
+    res_ram: ['RAM', 'Memory held by the API during upload, and by the worker with its validation processes during processing.',
+      'It should stay flat whatever the file size, because only one piece or one chunk is in memory at a time. A line that keeps climbing would mean a leak.'],
+    res_db: ['DB writes', 'Write-ahead log (WAL) the database writes for each chunk\'s transaction: the new contacts, rejected rows, index entries and checkpoint.',
+      'This is the database\'s disk-write load, arriving in bursts once per chunk. A larger CHUNK_SIZE makes fewer, bigger spikes; a smaller one makes more, smaller ones.'],
     done: ['Import row status done', 'Status becomes done and the final counts stay on the imports row.',
       'Progress and totals are read from this one row, never by counting millions of contacts.'],
   };
@@ -79,13 +85,15 @@
   // ---------------------------------------------------------------- events -> timeline segments
   function build() {
     const segs = [];
-    const st = { vals: {}, seen: new Set(), loop: {}, stats: null };
+    const st = { vals: {}, seen: new Set(), loop: {}, stats: null, db: null };
     const push = (node, dur, vals = {}, extra = {}) => {
       Object.assign(st.vals, vals);
       st.seen.add(node);
       segs.push({ node, dur: Math.max(1, dur), vals: { ...st.vals }, seen: new Set(st.seen), loop: { ...st.loop },
-        stats: st.stats && { ...st.stats }, ...extra });
+        stats: st.stats && { ...st.stats }, db: st.db, ...extra });
     };
+    // m = resource usage during a segment: who (api | worker), cores used, RSS MB; wal = MB written by the DB.
+    const use = (who, cpu, rss) => (cpu == null ? {} : { m: { who, cpu, rss } });
     const ev = S.events, at = e => new Date(e.at).getTime();
     let file = '', total = 0, chunksTotal = 1, prevAt = null;
 
@@ -99,14 +107,15 @@
         const samples = d.samples || [];
         const pieces = Math.max(1, Math.ceil(d.bytes / 65536));
         for (let i = 0; i < samples.length; i++) {
-          const [t, b, h] = samples[i];
+          const [t, b, h, cpu, rss] = samples[i];
+          const m = use('api', cpu, rss);
           const dt = i ? t - samples[i - 1][0] : t;
           const q = Math.max(MIN_PIECE, dt) / 4, piece = Math.max(1, Math.ceil(b / 65536)), last = i === samples.length - 1;
           st.loop = { upload: `piece ${fmt(piece)} / ${fmt(pieces)}` };
-          push('receive', q, { receive: `piece ${fmt(piece)} · 64 KB` });
-          push('write', q, { write: `${bytes(b)} / ${bytes(d.bytes)} → ${d.path.split('/').pop()}` });
-          push('hash', q, { hash: `sha256 ${h}…` });
-          push('moreBytes', q, { moreBytes: last ? 'no' : 'yes' });
+          push('receive', q, { receive: `piece ${fmt(piece)} · 64 KB` }, m);
+          push('write', q, { write: `${bytes(b)} / ${bytes(d.bytes)} → ${d.path.split('/').pop()}` }, m);
+          push('hash', q, { hash: `sha256 ${h}…` }, m);
+          push('moreBytes', q, { moreBytes: last ? 'no' : 'yes' }, m);
         }
         st.loop = {};
         st.vals.hash = `sha256 ${d.sha256.slice(0, 16)}…`;
@@ -117,6 +126,7 @@
         push('push', MIN_EVENT, { push: `import_id ${S.id} · waiting for a worker` });
         prevAt = at(e);
       } else if (e.kind === 'claimed') {
+        if (d.cores) S.cores = d.cores;
         const wait = prevAt ? at(e) - prevAt : 0;
         push('pick', Math.min(1500, Math.max(MIN_EVENT, wait)), {
           push: `import_id ${S.id} · waited ${clock(wait)}`,
@@ -126,13 +136,18 @@
       } else if (e.kind === 'chunk') {
         chunksTotal = Math.max(chunksTotal, d.n);
         st.loop = { chunk: `chunk ${d.n} / ${chunksTotal}` };
-        push('read', Math.max(MIN_STEP, d.read_ms), { read: `rows ${fmt(d.first_row)}–${fmt(d.last_row)} · ${ms(d.read_ms)}` });
-        push('validate', Math.max(MIN_STEP, d.validate_ms), { validate: `${fmt(d.valid)} valid · ${fmt(d.invalid)} invalid · ${ms(d.validate_ms)}` });
+        push('read', Math.max(MIN_STEP, d.read_ms), { read: `rows ${fmt(d.first_row)}–${fmt(d.last_row)} · ${ms(d.read_ms)}` },
+          use('worker', d.cpu_read, d.rss_mb));
+        push('validate', Math.max(MIN_STEP, d.validate_ms), { validate: `${fmt(d.valid)} valid · ${fmt(d.invalid)} invalid · ${ms(d.validate_ms)}` },
+          use('worker', d.cpu_validate, d.rss_mb));
         const s = st.stats || { rows: 0, est: 0, valid: 0, invalid: 0, dups: 0, inserted: 0 };
         st.stats = { ...s, rows: s.rows + d.rows, inserted: s.inserted + d.inserted, invalid: s.invalid + d.invalid, dups: s.dups + d.dups };
-        push('save', Math.max(MIN_STEP, d.save_ms), { save: `+${fmt(d.inserted)} new · ${fmt(d.dups)} duplicate · ${ms(d.save_ms)}` });
-        push('progress', Math.max(MIN_STEP, d.progress_ms), { progress: `checkpoint row ${fmt(d.last_row)}` });
-        push('moreRows', MIN_STEP, { moreRows: 'yes' });
+        if (d.wal_mb != null) st.db = { wal: d.wal_mb, ms: d.save_ms + d.progress_ms, n: d.n };
+        const saving = use('worker', d.cpu_save, d.rss_mb);
+        push('save', Math.max(MIN_STEP, d.save_ms), { save: `+${fmt(d.inserted)} new · ${fmt(d.dups)} duplicate · ${ms(d.save_ms)}` },
+          { ...saving, wal: d.wal_mb });
+        push('progress', Math.max(MIN_STEP, d.progress_ms), { progress: `checkpoint row ${fmt(d.last_row)}` }, saving);
+        push('moreRows', MIN_STEP, { moreRows: 'yes' }, saving);
       } else if (e.kind === 'done') {
         if (segs.length && segs[segs.length - 1].node === 'moreRows') {
           segs[segs.length - 1].vals.moreRows = 'no';
@@ -152,6 +167,53 @@
     for (const s of segs) { s.start = acc; acc += s.dur; }
     S.segs = segs;
     S.total = acc;
+    drawCharts();
+  }
+
+  // ---------------------------------------------------------------- resource charts
+  // Step lines over the same timeline as the scrubber: x = segment start/end, y = value during it.
+  const W = 1000, H = 44;
+  function series(pick, max, filled) {
+    let d = '', open = false, x0 = 0;
+    const X = t => ((t / (S.total || 1)) * W).toFixed(1), Y = v => (H - 1 - (Math.min(v, max) / max) * (H - 4)).toFixed(1);
+    const close = end => { if (open) { d += filled ? `L${end},${H}L${x0},${H}Z` : ''; open = false; } };
+    for (const s of S.segs) {
+      const v = pick(s);
+      if (v == null) { close(X(s.start)); continue; }
+      const a = X(s.start), b = X(s.start + s.dur), y = Y(v);
+      if (!open) { d += `M${a},${filled ? H : y}${filled ? `L${a},${y}` : ''}`; x0 = a; open = true; } else d += `L${a},${y}`;
+      d += `L${b},${y}`;
+    }
+    close(X(S.total));
+    return d;
+  }
+
+  function drawCharts() {
+    const segs = S.segs, cores = S.cores || S.cfg.cores || 1;
+    const who = w => s => (s.m?.who === w ? s.m : null);
+    const rssMax = Math.max(64, ...segs.map(s => s.m?.rss || 0)) * 1.2;
+    const walMax = Math.max(0.5, ...segs.map(s => s.wal || 0)) * 1.2;
+    for (const w of ['api', 'worker']) {
+      $(`.rc[data-c="cpu"] path.${w}`).setAttribute('d', series(s => who(w)(s)?.cpu, cores, true));
+      $(`.rc[data-c="ram"] path.${w}`).setAttribute('d', series(s => who(w)(s)?.rss, rssMax, true));
+    }
+    $('.rc[data-c="db"] path.db').setAttribute('d', series(s => (s.wal != null ? s.wal : null), walMax, true));
+    S.peaks = {
+      cpu: Math.max(0, ...segs.map(s => s.m?.cpu || 0)), rss: Math.max(0, ...segs.map(s => s.m?.rss || 0)),
+      wal: segs.reduce((a, s) => a + (s.wal || 0), 0),
+    };
+  }
+
+  function renderCharts(seg) {
+    const cores = S.cores || S.cfg.cores || 1, pk = S.peaks || {};
+    const m = seg?.m, db = seg?.db;
+    const cpuEl = $('.rc[data-c="cpu"] .rv'), ramEl = $('.rc[data-c="ram"] .rv'), dbEl = $('.rc[data-c="db"] .rv');
+    cpuEl.textContent = m ? `${m.who} ${m.cpu.toFixed(1)} / ${cores} cores` : (pk.cpu ? `peak ${pk.cpu.toFixed(1)} / ${cores} cores` : '');
+    cpuEl.title = `peak ${(pk.cpu || 0).toFixed(2)} of ${cores} cores`;
+    ramEl.textContent = m ? `${m.who} ${fmt(Math.round(m.rss))} MB` : (pk.rss ? `peak ${fmt(Math.round(pk.rss))} MB` : '');
+    ramEl.title = `peak ${fmt(Math.round(pk.rss || 0))} MB`;
+    dbEl.textContent = db ? `#${db.n} · ${db.wal.toFixed(1)} MB · ${ms(db.ms)}` : (pk.wal ? `total ${pk.wal.toFixed(1)} MB` : '');
+    dbEl.title = `chunk WAL / DB time · total ${(pk.wal || 0).toFixed(1)} MB for this import`;
   }
 
   // ---------------------------------------------------------------- render one moment
@@ -180,6 +242,7 @@
         $('.it', box).textContent = seg?.loop[l] ?? '';
       }
       $('.loop[data-l="queue"]').classList.toggle('active', seg?.node === 'push');
+      renderCharts(seg);
       const s = seg?.stats;
       $('#stats').innerHTML = s ? [
         `rows <b>${fmt(s.rows)}</b> / ~${fmt(s.est)}`,
@@ -192,6 +255,8 @@
     const sc = $('#scrub');
     if (!sc.dragging) sc.value = Math.round(p * 10);
     sc.style.setProperty('--p', `${p}%`);
+    const cx = (p * 10).toFixed(1);
+    $$('.rc .cur').forEach(l => { l.setAttribute('x1', cx); l.setAttribute('x2', cx); });
     $('#time').textContent = `${clock(S.t)} / ${clock(S.total)}`;
   }
 
