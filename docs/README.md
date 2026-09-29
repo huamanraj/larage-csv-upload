@@ -13,6 +13,10 @@ The repo already holds a working implementation of the proposed design (`app/`).
 | 3 | [Alternatives compared](03-alternatives-comparison.md) | A side-by-side matrix of every option we considered |
 | 4 | [Debate guide](04-debate-guide.md) | Likely objections with answers, decision criteria, and when to revisit |
 
+### Testing
+
+- [Agent test prompt](agent-test-prompt.md): a copy-paste prompt for an AI agent in a VM. It sets up Docker, generates random and "golden" CSVs, runs 15 tests (validation, dedupe, idempotency, 1M rows, crash/resume, UI) and writes a report.
+
 ### Alternatives, in detail
 
 | # | Alternative | One-line verdict |
