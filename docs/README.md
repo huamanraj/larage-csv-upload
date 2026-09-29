@@ -15,6 +15,8 @@ The repo already holds a working implementation of the proposed design (`app/`).
 
 ### Testing
 
+- [Benchmarks](benchmarks.md): time, CPU, RAM and DB load for 100k–1M rows on 2 and 4 cores (measured) and 8 cores (projected). Re-run them on your own VM with `scripts/bench_system.py`.
+
 - [Agent test prompt](agent-test-prompt.md): a copy-paste prompt for an AI agent in a VM. It sets up Docker, generates random and "golden" CSVs, runs 15 tests (validation, dedupe, idempotency, 1M rows, crash/resume, UI) and writes a report.
 
 ### Alternatives, in detail

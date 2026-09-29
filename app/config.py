@@ -12,5 +12,7 @@ IMPORT_CONCURRENCY = int(os.getenv("IMPORT_CONCURRENCY", "1"))
 ALLOW_RESET = os.getenv("ALLOW_RESET", "1") == "1"
 # Parallel validation slices per chunk when an import has no core cap; default cores - 1.
 # (The pool itself starts one process per available CPU so any cap up to all cores can be used.)
-POOL_SIZE = int(os.getenv("POOL_SIZE", "0")) or max(1, (os.cpu_count() or 2) - 1)
+# Counts the CPUs this process may use (a container or `taskset` can allow fewer than the host has).
+_AVAILABLE_CPUS = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 2)
+POOL_SIZE = int(os.getenv("POOL_SIZE", "0")) or max(1, _AVAILABLE_CPUS - 1)
 LOCK_TIMEOUT = os.getenv("LOCK_TIMEOUT", "10 min")
