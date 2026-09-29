@@ -8,6 +8,7 @@ x-app: &app
     CHUNK_SIZE: "10000"
     IMPORT_CONCURRENCY: "1"      # global cap on running imports
     DEFAULT_REGION: "IN"         # country for numbers without a country code and no `country` value
+    ALLOW_RESET: "1"             # POC: "reset db" button empties all import data; set "0" anywhere real
   volumes:
     - imports:/data/imports
   depends_on:

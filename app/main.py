@@ -67,7 +67,23 @@ async def index():
 @app.get("/api/config")
 async def get_config():
     return {"chunk_size": config.CHUNK_SIZE, "max_upload_bytes": config.MAX_UPLOAD_BYTES,
-            "default_region": config.DEFAULT_REGION, "cores": CORES, "ram_mb": RAM_TOTAL_MB}
+            "default_region": config.DEFAULT_REGION, "cores": CORES, "ram_mb": RAM_TOTAL_MB,
+            "allow_reset": config.ALLOW_RESET}
+
+
+@app.post("/api/reset")
+async def reset():
+    """Empty all import data and stored files so the same CSV can be imported again (POC only)."""
+    if not config.ALLOW_RESET:
+        raise HTTPException(403, "reset is disabled (ALLOW_RESET=0)")
+    async with pool.connection() as conn:
+        # Waits for a chunk that is mid-transaction; that worker then finds its import gone and stops.
+        await conn.execute("TRUNCATE imports, contacts, import_errors, import_events RESTART IDENTITY")
+    removed = 0
+    for f in Path(config.DATA_DIR).glob("*.csv"):
+        f.unlink(missing_ok=True)
+        removed += 1
+    return {"ok": True, "files_removed": removed}
 
 
 async def event(conn, import_id, kind, data, at=None):

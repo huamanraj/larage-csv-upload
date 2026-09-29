@@ -397,8 +397,29 @@
     window.addEventListener('scroll', close, { passive: true });
   }
 
+  async function resetDb() {
+    if (!confirm('Delete ALL imports, contacts and uploaded files?\n\nUse this to re-test the same CSV from scratch.')) return;
+    const b = $('#resetBtn');
+    b.disabled = true;
+    try {
+      const r = await api('/api/reset', { method: 'POST' });
+      clearTimeout(S.timer);
+      Object.assign(S, { id: null, imp: null, events: [], lastEvent: 0, segs: [], total: 0, t: 0, shown: -2 });  // -2 forces a redraw
+      setPlaying(false);
+      history.replaceState(null, '', location.pathname);
+      $('#dropT').textContent = 'drop a csv';
+      $('#dropS').textContent = 'columns: phone, name, country · others kept as vars';
+      drawCharts();
+      toast(`database reset · ${r.files_removed} file(s) removed`);
+    } catch (e) { toast(e.message, true); }
+    b.disabled = false;
+  }
+
   function wire() {
     wireInfo();
+    const rb = $('#resetBtn');
+    rb.classList.toggle('hidden', S.cfg.allow_reset === false);
+    rb.addEventListener('click', resetDb);
     const drop = $('#drop'), file = $('#file');
     file.addEventListener('change', () => { if (file.files[0]) upload(file.files[0]); file.value = ''; });
     ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));

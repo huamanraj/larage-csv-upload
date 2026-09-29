@@ -8,6 +8,8 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "10000"))
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "IN")
 # Global cap on imports running at once (across all worker processes).
 IMPORT_CONCURRENCY = int(os.getenv("IMPORT_CONCURRENCY", "1"))
+# POC convenience: the UI's "reset db" button empties every import table. Set to 0 anywhere real.
+ALLOW_RESET = os.getenv("ALLOW_RESET", "1") == "1"
 # Validation processes; default cores - 1.
 POOL_SIZE = int(os.getenv("POOL_SIZE", "0")) or max(1, (os.cpu_count() or 2) - 1)
 LOCK_TIMEOUT = os.getenv("LOCK_TIMEOUT", "10 min")

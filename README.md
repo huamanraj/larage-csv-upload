@@ -85,6 +85,7 @@ Results can be paged with `GET /api/campaigns/{id}/contacts?after_id=` (keyset p
 | `IMPORT_CONCURRENCY` | `1` | global limit on running imports |
 | `POOL_SIZE` | cores − 1 | validation processes |
 | `LOCK_TIMEOUT` | `10 min` | when a silent worker's job is re-claimed |
+| `ALLOW_RESET` | `1` | show the **reset db** button (bottom-left). It runs `TRUNCATE` on all import tables and deletes stored CSVs, so the same file can be re-tested. Set it to `0` anywhere real |
 
 ## Design docs
 

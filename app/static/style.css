@@ -140,6 +140,14 @@ input[type=range]::-moz-range-thumb { width: 10px; height: 10px; background: var
 .pop p b { display: block; font-weight: 500; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin-bottom: 1px; }
 .pop .py { color: var(--text); }
 
+.reset {
+  position: fixed; left: 16px; bottom: 16px; z-index: 30; height: 26px; padding: 0 10px; border: 1px solid var(--line);
+  border-radius: var(--r); background: var(--panel); color: var(--faint); font: 11px var(--mono); cursor: pointer;
+  transition: border-color .2s, color .2s, background .2s;
+}
+.reset:hover { border-color: rgba(212, 98, 95, .6); color: var(--bad); background: rgba(212, 98, 95, .06); }
+.reset:disabled { opacity: .5; cursor: default; }
+
 .toast { position: fixed; right: 20px; bottom: 20px; padding: 10px 14px; background: #101318; border: 1px solid var(--line-2); border-radius: var(--r); font-size: 12px; opacity: 0; transform: translateY(6px); transition: opacity .25s, transform .25s var(--ease); pointer-events: none; }
 .toast.on { opacity: 1; transform: none; }
 .toast.err { border-color: rgba(212, 98, 95, .5); }
