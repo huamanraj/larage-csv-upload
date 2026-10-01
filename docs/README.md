@@ -19,6 +19,10 @@ The repo already holds a working implementation of the proposed design (`app/`).
 
 - [Agent test prompt](agent-test-prompt.md): a copy-paste prompt for an AI agent in a VM. It sets up Docker, generates random and "golden" CSVs, runs 15 tests (validation, dedupe, idempotency, 1M rows, crash/resume, UI) and writes a report.
 
+### Node / BullMQ teams
+
+- [CSV import guide for BullMQ + Postgres](csv-import-guide-bullmq.md): column mapping for messy CSVs, the cheapest phone validation, duplicates with one batched `ON CONFLICT` insert, and why 20k rows taking 5 minutes means per-row work (with a fix checklist and a TypeScript worker).
+
 ### Alternatives, in detail
 
 | # | Alternative | One-line verdict |
