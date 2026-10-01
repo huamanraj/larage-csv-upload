@@ -6,9 +6,11 @@ Accepted CSV layouts (header names, case-insensitive), see app/columns.py:
 Numbers without a country code are read in the row's country, else DEFAULT_REGION.
 Other non-empty columns are kept in contacts.vars.
 """
+import asyncio
 import csv
 import hashlib
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,17 +19,32 @@ from urllib.parse import unquote
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from . import config
 from .columns import resolve
 from .db import init_schema
-from .metrics import ALLOWED_CPUS, CORES, RAM_TOTAL_MB, Usage
+from .metrics import ALLOWED_CPUS, CORES, RAM_TOTAL_MB, SystemSampler, Usage
 
 STATIC = Path(__file__).parent / "static"
 SAMPLE_EVERY = 1 / 60  # record ~60 upload progress samples for the timeline
 pool: AsyncConnectionPool = None  # opened in lifespan
+log = logging.getLogger("api")
+
+
+async def sample_loop():
+    """CPU and memory of this API process (busy while files upload) for the live system charts."""
+    sampler = SystemSampler("api")
+    while True:
+        await asyncio.sleep(SystemSampler.EVERY)
+        try:
+            data = await asyncio.to_thread(sampler.tick)
+            async with pool.connection() as conn:
+                await conn.execute("INSERT INTO system_samples (source, data) VALUES ('api', %s)", (json.dumps(data),))
+        except Exception as e:  # noqa: BLE001  (never let sampling take the API down)
+            log.warning("sampler: %s", e)
 
 
 @asynccontextmanager
@@ -38,7 +55,9 @@ async def lifespan(_app):
     pool = AsyncConnectionPool(config.DATABASE_URL, min_size=1, max_size=10, open=False,
                                kwargs={"autocommit": True, "row_factory": dict_row})
     await pool.open()
+    sampler = asyncio.create_task(sample_loop())
     yield
+    sampler.cancel()
     await pool.close()
 
 
@@ -68,7 +87,7 @@ async def index():
 async def get_config():
     return {"chunk_size": config.CHUNK_SIZE, "max_upload_bytes": config.MAX_UPLOAD_BYTES,
             "default_region": config.DEFAULT_REGION, "cores": CORES, "ram_mb": RAM_TOTAL_MB,
-            "allow_reset": config.ALLOW_RESET, "cpus": len(ALLOWED_CPUS)}
+            "allow_reset": config.ALLOW_RESET, "cpus": len(ALLOWED_CPUS), "slots": config.IMPORT_CONCURRENCY}
 
 
 @app.post("/api/reset")
@@ -96,19 +115,30 @@ def read_header(path):
         return next(csv.reader(f), [])
 
 
+# A new import row; without a campaign it gets its own (campaign id = import id), like a separate customer.
+NEW_IMPORT_SQL = """
+WITH n AS (SELECT nextval(pg_get_serial_sequence('imports', 'id')) AS id)
+INSERT INTO imports (id, campaign_id, file_name, cores) SELECT id, coalesce(%s, id), %s, %s FROM n
+RETURNING id, campaign_id, created_at
+"""
+
+
 @app.post("/api/imports", status_code=202)
-async def upload(request: Request, campaign_id: int = 1, cores: int | None = Query(None, ge=1, le=256)):
-    """1. create import row  2. stream body to local storage + sha256  3. mark queued (= push to the queue)."""
+async def upload(request: Request, campaign_id: int | None = Query(None, ge=1),
+                 cores: int | None = Query(None, ge=1, le=256)):
+    """1. create import row  2. stream body to local storage + sha256  3. mark queued (= push to the queue).
+
+    campaign_id: import into this campaign. Omitted: a new campaign of its own. Imports into different
+    campaigns run in parallel; imports into the same campaign run one after another."""
     size_hint = int(request.headers.get("content-length") or 0)
     if size_hint > config.MAX_UPLOAD_BYTES:
         raise HTTPException(413, "file too large")
     name = unquote(request.headers.get("x-file-name", "upload.csv"))[:255]
 
     async with pool.connection() as conn:
-        cur = await conn.execute("INSERT INTO imports (campaign_id, file_name, cores) VALUES (%s, %s, %s) "
-                                 "RETURNING id, created_at", (campaign_id, name, cores))
+        cur = await conn.execute(NEW_IMPORT_SQL, (campaign_id, name, cores))
         row = await cur.fetchone()
-        import_id = row["id"]
+        import_id, campaign_id = row["id"], row["campaign_id"]
         await event(conn, import_id, "created", {"file_name": name, "size": size_hint})
 
     path = Path(config.DATA_DIR) / f"{import_id}.csv"
@@ -153,33 +183,71 @@ async def upload(request: Request, campaign_id: int = 1, cores: int | None = Que
 
     sha = h.hexdigest()
     est_rows = max(0, newlines + (0 if last == b"\n" else 1) - 1)
-    async with pool.connection() as conn, conn.transaction():
-        cur = await conn.execute("SELECT id FROM imports WHERE campaign_id=%s AND file_sha256=%s", (campaign_id, sha))
-        dup = await cur.fetchone()
-        if dup:  # same file already imported into this campaign
-            path.unlink(missing_ok=True)
+    try:
+        # UNIQUE (campaign_id, file_sha256) decides which upload of the same file wins, even when two finish
+        # at the same moment (a SELECT-then-UPDATE check would let both through).
+        async with pool.connection() as conn, conn.transaction():
+            await conn.execute("""UPDATE imports SET file_path=%s, file_sha256=%s, file_size=%s, est_rows=%s,
+                                  status='queued' WHERE id=%s""", (str(path), sha, size, est_rows, import_id))
+            await event(conn, import_id, "uploaded", {"bytes": size, "sha256": sha, "est_rows": est_rows,
+                                                       "path": str(path), "samples": samples})
+            await event(conn, import_id, "queued", {"import_id": import_id})
+    except UniqueViolation:  # same file already imported into this campaign: return that import
+        path.unlink(missing_ok=True)
+        async with pool.connection() as conn, conn.transaction():
+            cur = await conn.execute("SELECT id FROM imports WHERE campaign_id=%s AND file_sha256=%s", (campaign_id, sha))
+            dup = await cur.fetchone()
             await conn.execute("DELETE FROM import_events WHERE import_id=%s", (import_id,))
             await conn.execute("DELETE FROM imports WHERE id=%s", (import_id,))
-            return JSONResponse({"import_id": dup["id"], "duplicate": True}, status_code=200)
-        await conn.execute("""UPDATE imports SET file_path=%s, file_sha256=%s, file_size=%s, est_rows=%s,
-                              status='queued' WHERE id=%s""", (str(path), sha, size, est_rows, import_id))
-        await event(conn, import_id, "uploaded", {"bytes": size, "sha256": sha, "est_rows": est_rows,
-                                                   "path": str(path), "samples": samples})
-        await event(conn, import_id, "queued", {"import_id": import_id})
+        return JSONResponse({"import_id": dup["id"], "duplicate": True}, status_code=200)
     return {"import_id": import_id, "duplicate": False}
+
+
+RECENT_IMPORTS_SQL = """
+SELECT id, campaign_id, file_name, status, cores, est_rows, file_size, error,
+       checkpoint_row AS rows, valid_rows, invalid_rows, duplicate_rows,
+       extract(epoch FROM created_at) * 1000 AS created_ms, extract(epoch FROM started_at) * 1000 AS started_ms,
+       extract(epoch FROM finished_at) * 1000 AS finished_ms,
+       round(extract(epoch FROM finished_at - started_at)::numeric, 2) AS seconds,
+       round(extract(epoch FROM coalesce(finished_at, now()) - started_at)::numeric, 2) AS elapsed,
+       (SELECT (data->>'cores_used')::int FROM import_events e
+         WHERE e.import_id = i.id AND kind = 'opened' ORDER BY id DESC LIMIT 1) AS cores_used,
+       -- queued behind another import of the same campaign (one import per campaign at a time)
+       (SELECT o.id FROM imports o WHERE i.status = 'queued' AND o.campaign_id = i.campaign_id
+          AND o.id <> i.id AND o.status = 'processing' LIMIT 1) AS blocked_by,
+       (SELECT jsonb_build_object('chunks', count(*),
+                                  'email_blanked', coalesce(sum((data->>'email_blanked')::int), 0),
+                                  'date_blanked', coalesce(sum((data->>'date_blanked')::int), 0))
+          FROM import_events e WHERE e.import_id = i.id AND kind = 'chunk') AS chunk_stats,
+       (SELECT jsonb_object_agg(k, n) FROM (
+          SELECT r.key AS k, sum(r.value::int) AS n FROM import_events e, jsonb_each_text(e.data->'reasons') r
+          WHERE e.import_id = i.id AND e.kind = 'chunk' GROUP BY r.key) x) AS reasons
+FROM imports i ORDER BY id DESC LIMIT %s
+"""
 
 
 @app.get("/api/imports")
 async def list_imports(limit: int = Query(12, ge=1, le=100)):
-    """Recent imports with their core cap and timing, for comparing runs."""
+    """Recent imports: progress, validation results, timing and whether one waits on its campaign."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(RECENT_IMPORTS_SQL, (limit,))
+        return await cur.fetchall()
+
+
+@app.get("/api/monitor")
+async def monitor(after: int = 0, window: int = Query(600, ge=10, le=1800), limit: int = Query(12, ge=1, le=100)):
+    """Live system view, polled every second: CPU/memory samples from the api and worker (newer than `after`,
+    at most `window` seconds old) plus the recent imports, so parallel runs line up with the load they caused."""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            """SELECT id, campaign_id, file_name, status, cores, checkpoint_row AS rows, valid_rows, invalid_rows,
-                      duplicate_rows, round(extract(epoch FROM finished_at - started_at)::numeric, 2) AS seconds,
-                      (SELECT (data->>'cores_used')::int FROM import_events e
-                        WHERE e.import_id = i.id AND kind = 'opened' ORDER BY id DESC LIMIT 1) AS cores_used
-               FROM imports i ORDER BY id DESC LIMIT %s""", (limit,))
-        return await cur.fetchall()
+            """SELECT id, source, extract(epoch FROM at) * 1000 AS t, data FROM system_samples
+               WHERE id > %s AND at > now() - make_interval(secs => %s) ORDER BY id""", (after, window))
+        samples = await cur.fetchall()
+        cur = await conn.execute(RECENT_IMPORTS_SQL, (limit,))
+        imports = await cur.fetchall()
+        cur = await conn.execute("SELECT extract(epoch FROM now()) * 1000 AS now")
+        now = (await cur.fetchone())["now"]
+    return {"now": now, "samples": samples, "imports": imports}
 
 
 @app.post("/api/imports/{import_id}/rerun")
@@ -192,8 +260,9 @@ async def rerun(import_id: int, cores: int | None = Query(None, ge=1, le=256)):
         if not src or not src["file_path"] or not Path(src["file_path"]).exists():
             raise HTTPException(404, "original file not found (it may have been reset)")
         cur = await conn.execute(
-            """INSERT INTO imports (campaign_id, file_name, file_path, file_sha256, file_size, est_rows, status, cores)
-               VALUES ((SELECT coalesce(max(campaign_id), 0) + 1 FROM imports), %s, %s, %s, %s, %s, 'queued', %s)
+            """WITH n AS (SELECT nextval(pg_get_serial_sequence('imports', 'id')) AS id)
+               INSERT INTO imports (id, campaign_id, file_name, file_path, file_sha256, file_size, est_rows, status, cores)
+               SELECT id, id, %s, %s, %s, %s, %s, 'queued', %s FROM n
                RETURNING id, campaign_id""",
             (src["file_name"], src["file_path"], src["file_sha256"], src["file_size"], src["est_rows"], cores))
         row = await cur.fetchone()

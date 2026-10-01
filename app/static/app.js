@@ -47,8 +47,8 @@
       'Each chunk is a small, self-contained transaction: bounded memory, steady progress, and a crash only redoes one chunk.'],
     read: ['Read next rows', 'The next 10,000 rows are read; rows up to the checkpoint are skipped on a resume.',
       'Chunks bound memory and keep each database write small.'],
-    validate: ['Validate rows', 'Each phone is cleaned to +E.164 across CPU cores. The first valid phone column wins; empty, invalid and Excel 9.19E+11 values are rejected.',
-      'The calling layer needs dialable numbers in one format, and one format is what makes duplicates detectable.'],
+    validate: ['Validate rows', 'Each phone is cleaned to +E.164 across CPU cores; the first valid phone column wins. A row is rejected when no number is usable: empty, too_short (< 5 digits), sci_notation (Excel 9.19E+11), invalid for its country, or junk (9999999999). E-mail and birthday columns are checked too: a bad value is blanked, the row is kept.',
+      'The calling layer needs dialable numbers in one format, and one format is what makes duplicates detectable. Cheap checks run first, so most rows never reach the slower phone parser.'],
     save: ['Save chunk to contacts', 'Valid rows are COPYed into a temp table, then INSERT … ON CONFLICT DO NOTHING into contacts. Rejects go to import_errors with a reason.',
       'COPY is about 10× faster than row inserts, and the unique index guarantees one contact per phone per campaign.'],
     progress: ['Save checkpoint + progress', 'checkpoint_row and the counters are updated in the same transaction as the saved rows.',
@@ -57,9 +57,13 @@
       'A fresh lease tells other workers this one is alive, so they do not take the job over.'],
     cores: ['Core cap', 'Limits the worker to the first N CPU cores (Linux CPU affinity) and validates each chunk in N parallel slices. auto uses every core for the worker, validating in cores − 1 slices.',
       'Run the same file at 1, 2, 4… cores to see how latency scales. Validation speeds up with more cores; reading and the database save do not. Postgres itself is not capped.'],
-    runs: ['Runs', 'Recent imports with their core cap, processing time and throughput. re-run processes a stored file again with the core cap selected above.',
+    runs: ['Imports', 'Recent imports with live progress, results, processing time and throughput. waiting means another import of the same campaign is running. re-run processes a stored file again with the core cap selected above.',
       'Each re-run goes into a fresh campaign, so every run does identical work (no duplicates from the previous run) and the times are directly comparable.'],
-    res_cpu: ['CPU', 'Cores busy during each step: the API process while it receives the upload, then the worker plus its validation processes for each chunk\'s read, validate and save.',
+    campaign: ['Campaign', 'own per file: every file goes into its own campaign, like files from different customers; they are processed in parallel (up to the worker\'s slots). shared: every file goes into campaign 1; they are processed one after another.',
+      'Two imports into the same campaign would race on its duplicate check, so the queue never runs them together. Different campaigns share nothing, so they can run side by side.'],
+    system: ['System', 'CPU and memory of the worker, the API and Postgres, sampled every 0.5 s, plus the database\'s write rate (WAL/s) and one bar per import on the same time axis. Hover to read any moment.',
+      'Shows what parallel imports cost: CPU climbs with each extra import until the cores are full, then imports slow each other down; memory stays flat because each import holds one chunk at a time. Under Docker, Postgres runs in another container, so its CPU shows as part of "db + other".'],
+    res_cpu: ['CPU', 'Cores busy during each step: the API process while it receives the upload, then the worker plus its validation processes for each chunk\'s read, validate and save. When several imports run at once, the worker figure covers all of them.',
       'Validation is the CPU-heavy part and spreads across cores − 1, so the API stays free. During save the worker mostly waits on the database, which shows as a dip here and a spike in DB writes.'],
     res_ram: ['RAM', 'Memory held by the API during upload, and by the worker with its validation processes during processing.',
       'It should stay flat whatever the file size, because only one piece or one chunk is in memory at a time. A line that keeps climbing would mean a leak.'],
@@ -70,8 +74,9 @@
   };
 
   const S = { id: null, events: [], lastEvent: 0, imp: null, segs: [], total: 0, t: 0, speed: 1, playing: false,
-    shown: -1, timer: null, cfg: { chunk_size: 10000 }, cap: null, runsFor: null };
+    shown: -1, timer: null, cfg: { chunk_size: 10000 }, cap: null, camp: 'own', uploads: new Map() };
   try { S.cap = JSON.parse(localStorage.getItem('coresCap')) || null; } catch (_) { /* private mode */ }
+  try { S.camp = localStorage.getItem('campMode') === 'shared' ? 'shared' : 'own'; } catch (_) { /* private mode */ }
 
   async function api(url, opts) {
     const r = await fetch(url, opts);
@@ -98,7 +103,7 @@
         stats: st.stats && { ...st.stats }, db: st.db, ...extra });
     };
     // m = resource usage during a segment: who (api | worker), cores used, RSS MB; wal = MB written by the DB.
-    const use = (who, cpu, rss) => (cpu == null ? {} : { m: { who, cpu, rss } });
+    const use = (who, cpu, rss) => (cpu == null ? {} : { m: { who, cpu, rss, running: st.stats?.running } });
     const ev = S.events, at = e => new Date(e.at).getTime();
     S.cores = null;
     let file = '', total = 0, chunksTotal = 1, prevAt = null;
@@ -127,7 +132,7 @@
         st.loop = {};
         st.vals.hash = `sha256 ${d.sha256.slice(0, 16)}…`;
         chunksTotal = Math.max(1, Math.ceil(d.est_rows / S.cfg.chunk_size));
-        st.stats = { rows: 0, est: d.est_rows, valid: 0, invalid: 0, dups: 0, inserted: 0 };
+        st.stats = { rows: 0, est: d.est_rows, valid: 0, invalid: 0, dups: 0, inserted: 0, reasons: {}, email: 0, date: 0 };
       } else if (e.kind === 'queued') {
         push('queued', MIN_EVENT, { queued: 'status queued' });
         push('push', MIN_EVENT, { push: `import_id ${S.id} · waiting for a worker` });
@@ -140,17 +145,23 @@
           pick: `${d.worker} · SKIP LOCKED${d.resume_from ? ` · resume after row ${fmt(d.resume_from)}` : ''}` });
       } else if (e.kind === 'opened') {
         if (d.cores_used) S.cores = d.cores_used;
-        const lim = d.cores_used ? (d.cap ? ` · capped to ${d.cores_used} of ${S.cfg.cpus || d.cores_used} cores` : ` · all ${d.cores_used} cores`) : '';
-        push('open', MIN_EVENT, { open: `${d.path.split('/').pop()} · ${bytes(d.bytes)}${lim}` });
+        const lim = !d.cores_used ? '' : !d.cap ? ` · all ${d.cores_used} cores`
+          : d.pinned === false ? ` · ${d.cores_used} validation slices` : ` · capped to ${d.cores_used} of ${S.cfg.cpus || d.cores_used} cores`;
+        const chk = Object.entries(d.checked || {}).filter(([, v]) => v.length).map(([k]) => k).join(' + ');
+        push('open', MIN_EVENT, { open: `${d.path.split('/').pop()} · ${bytes(d.bytes)}${lim}${chk ? ` · checks ${chk}` : ''}` });
       } else if (e.kind === 'chunk') {
         chunksTotal = Math.max(chunksTotal, d.n);
         st.loop = { chunk: `chunk ${d.n} / ${chunksTotal}` };
         push('read', Math.max(MIN_STEP, d.read_ms), { read: `rows ${fmt(d.first_row)}–${fmt(d.last_row)} · ${ms(d.read_ms)}` },
           use('worker', d.cpu_read, d.rss_mb));
-        push('validate', Math.max(MIN_STEP, d.validate_ms), { validate: `${fmt(d.valid)} valid · ${fmt(d.invalid)} invalid · ${ms(d.validate_ms)}` },
+        const fixed = (d.email_blanked || 0) + (d.date_blanked || 0);
+        push('validate', Math.max(MIN_STEP, d.validate_ms), { validate: `${fmt(d.valid)} valid · ${fmt(d.invalid)} invalid${fixed ? ` · ${fmt(fixed)} fields blanked` : ''} · ${ms(d.validate_ms)}` },
           use('worker', d.cpu_validate, d.rss_mb));
-        const s = st.stats || { rows: 0, est: 0, valid: 0, invalid: 0, dups: 0, inserted: 0 };
-        st.stats = { ...s, rows: s.rows + d.rows, inserted: s.inserted + d.inserted, invalid: s.invalid + d.invalid, dups: s.dups + d.dups };
+        const s = st.stats || { rows: 0, est: 0, valid: 0, invalid: 0, dups: 0, inserted: 0, reasons: {}, email: 0, date: 0 };
+        const reasons = { ...(s.reasons || {}) };
+        for (const [k, v] of Object.entries(d.reasons || {})) reasons[k] = (reasons[k] || 0) + v;
+        st.stats = { ...s, rows: s.rows + d.rows, inserted: s.inserted + d.inserted, invalid: s.invalid + d.invalid, dups: s.dups + d.dups,
+          reasons, email: (s.email || 0) + (d.email_blanked || 0), date: (s.date || 0) + (d.date_blanked || 0), running: d.running };
         if (d.wal_mb != null) st.db = { wal: d.wal_mb, ms: d.save_ms + d.progress_ms, n: d.n };
         const saving = use('worker', d.cpu_save, d.rss_mb);
         push('save', Math.max(MIN_STEP, d.save_ms), { save: `+${fmt(d.inserted)} new · ${fmt(d.dups)} duplicate · ${ms(d.save_ms)}` },
@@ -224,7 +235,8 @@
       [cpuEl, ramEl, dbEl].forEach(el => { el.textContent = msg; el.title = 'This import ran before CPU/RAM tracking was added, or the worker could not read it.'; });
       return;
     }
-    cpuEl.textContent = m ? `${m.who} ${m.cpu.toFixed(1)} / ${cores} cores` : (pk.cpu ? `peak ${pk.cpu.toFixed(1)} / ${cores} cores` : '');
+    const who = m && m.who === 'worker' && m.running > 1 ? `worker (${m.running} imports)` : m?.who;
+    cpuEl.textContent = m ? `${who} ${m.cpu.toFixed(1)} / ${cores} cores` : (pk.cpu ? `peak ${pk.cpu.toFixed(1)} / ${cores} cores` : '');
     cpuEl.title = `peak ${(pk.cpu || 0).toFixed(2)} of ${cores} cores`;
     ramEl.textContent = m ? `${m.who} ${fmt(Math.round(m.rss))} MB` : (pk.rss ? `peak ${fmt(Math.round(pk.rss))} MB` : '');
     ramEl.title = `peak ${fmt(Math.round(pk.rss || 0))} MB`;
@@ -260,11 +272,13 @@
       $('.loop[data-l="queue"]').classList.toggle('active', seg?.node === 'push');
       renderCharts(seg);
       const s = seg?.stats;
+      const why = Object.entries(s?.reasons || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k.replace('_', ' ')} ${fmt(v)}`).join(' · ');
       $('#stats').innerHTML = s ? [
         `rows <b>${fmt(s.rows)}</b> / ~${fmt(s.est)}`,
         `<span class="ok">saved <b>${fmt(s.inserted)}</b></span>`,
         `<span class="dup">duplicate <b>${fmt(s.dups)}</b></span>`,
-        `<span class="bad">invalid <b>${fmt(s.invalid)}</b></span>`,
+        `<span class="bad">invalid <b>${fmt(s.invalid)}</b>${why ? ` (${esc(why)})` : ''}</span>`,
+        s.email || s.date ? `blanked <b>${fmt(s.email)}</b> e-mails · <b>${fmt(s.date)}</b> dates` : '',
       ].join('') : '';
     }
     const p = S.total ? (S.t / S.total) * 100 : 0;
@@ -313,7 +327,6 @@
         S.shown = -1;
       }
       if (!finished()) S.timer = setTimeout(poll, 700);
-      else if (S.runsFor !== id) { S.runsFor = id; loadRuns(); }
     } catch (e) {
       if (id === S.id) S.timer = setTimeout(poll, 2000);
     }
@@ -324,47 +337,270 @@
     $$('#runsBody tr').forEach(tr => tr.classList.toggle('cur', Number(tr.dataset.id) === id));
     await poll();
     if (!S.imp) return;
-    $('#dropT').textContent = `#${id} · ${S.imp.file_name}`;
-    $('#dropS').textContent = 'drop another csv to start a new import';
+    if (!S.uploads.size) {
+      $('#dropT').textContent = `#${id} · ${S.imp.file_name}`;
+      $('#dropS').textContent = 'drop more csv files to start new imports';
+    }
     // A finished import opens on its final state; a running one plays from the start and follows along.
     const live = !finished();
     S.t = live ? 0 : S.total;
     setPlaying(live);
   }
 
-  function upload(file) {
-    const max = S.cfg.max_upload_bytes || Infinity;
-    if (file.size > max) { toast(`${file.name} is ${bytes(file.size)}; limit is ${bytes(max)}`, true); return; }
+  // Several files upload at once; each becomes its own import (and, in "own per file" mode, its own campaign),
+  // so the worker processes them in parallel.
+  function uploadOne(file) {
+    return new Promise(resolve => {
+      const xhr = new XMLHttpRequest();
+      const q = new URLSearchParams();
+      if (S.camp === 'shared') q.set('campaign_id', '1');
+      if (S.cap) q.set('cores', S.cap);
+      xhr.open('POST', `/api/imports${q.toString() ? `?${q}` : ''}`);
+      xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+      xhr.setRequestHeader('Content-Type', 'text/csv');
+      const u = { loaded: 0, total: file.size };
+      S.uploads.set(file.name, u);
+      xhr.upload.onprogress = e => { u.loaded = e.loaded; u.total = e.total || file.size; uploadProgress(); };
+      const end = body => { S.uploads.delete(file.name); uploadProgress(); resolve(body); };
+      xhr.onerror = () => { toast(`${file.name}: upload failed`, true); end(null); };
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch (_) { /* not json */ }
+        if (xhr.status !== 200 && xhr.status !== 202) { toast(`${file.name}: ${body.detail || `upload failed (${xhr.status})`}`, true); end(null); return; }
+        if (body.duplicate) toast(`${file.name}: same file already imported as #${body.import_id}`);
+        end(body);
+      };
+      xhr.send(file);
+    });
+  }
+
+  function uploadProgress() {
+    const list = [...S.uploads.values()];
     const drop = $('#drop');
-    drop.classList.add('busy');
-    $('#dropT').textContent = file.name;
-    $('#dropS').textContent = 'uploading…';
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/imports${S.cap ? `?cores=${S.cap}` : ''}`);
-    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
-    xhr.setRequestHeader('Content-Type', 'text/csv');
-    xhr.upload.onprogress = e => {
-      const p = e.lengthComputable ? e.loaded / e.total : 0;
-      $('#dropBar').style.width = `${p * 100}%`;
-      $('#dropS').textContent = `uploading ${bytes(e.loaded)} / ${bytes(e.total)}`;
-    };
-    const reset = () => { drop.classList.remove('busy'); $('#dropBar').style.width = '0'; };
-    xhr.onerror = () => { reset(); toast('upload failed', true); };
-    xhr.onload = () => {
-      reset();
-      let body = {};
-      try { body = JSON.parse(xhr.responseText); } catch (_) { /* not json */ }
-      if (xhr.status !== 200 && xhr.status !== 202) {
-        toast(body.detail || `upload failed (${xhr.status})`, true);
-        $('#dropT').textContent = 'drop a csv';
-        $('#dropS').textContent = 'columns: phone, name, country · others kept as vars';
-        return;
+    drop.classList.toggle('busy', list.length > 0);
+    if (!list.length) { $('#dropBar').style.width = '0'; return; }
+    const loaded = list.reduce((a, u) => a + u.loaded, 0), total = list.reduce((a, u) => a + u.total, 0) || 1;
+    $('#dropBar').style.width = `${(loaded / total) * 100}%`;
+    $('#dropT').textContent = list.length > 1 ? `uploading ${list.length} files` : [...S.uploads.keys()][0];
+    $('#dropS').textContent = `${bytes(loaded)} / ${bytes(total)}`;
+    renderRuns();
+  }
+
+  async function upload(files) {
+    const max = S.cfg.max_upload_bytes || Infinity;
+    const ok = [...files].filter(f => {
+      if (f.size > max) toast(`${f.name} is ${bytes(f.size)}; limit is ${bytes(max)}`, true);
+      return f.size <= max && !S.uploads.has(f.name);
+    });
+    if (!ok.length) return;
+    const results = await Promise.all(ok.map(uploadOne));
+    const ids = results.filter(Boolean).map(r => r.import_id);
+    if (!S.uploads.size) {
+      $('#dropT').textContent = 'drop csv files';
+      $('#dropS').textContent = 'one or several at once · columns: phone, name, country, email, birthday …';
+    }
+    if (ids.length > 1) toast(`${ids.length} files queued · ${S.camp === 'shared' ? 'same campaign: one after another' : 'own campaigns: processed in parallel'}`);
+    if (ids.length) location.hash = Math.min(...ids);
+    pollMonitor();
+  }
+
+  // ---------------------------------------------------------------- system timeline (live)
+  // Samples come from the api and worker every 0.5 s. CPU and RAM are stacked per process group; DB writes is
+  // the WAL rate. Below, one bar per import on the same time axis: who ran when, and what it cost.
+  const M = { worker: [], api: [], lastId: 0, imports: [], offset: 0, hover: null, timer: null, range: [0, 1] };
+  const KEEP = 15 * 60e3, SW = 1000, SH = 56;
+
+  async function pollMonitor() {
+    if (M.busy) { M.again = true; return; }  // a request is in flight: refresh right after it
+    clearTimeout(M.timer);
+    M.busy = true;
+    try {
+      const d = await api(`/api/monitor?after=${M.lastId}&window=900&limit=12`);
+      M.offset = d.now - Date.now();
+      for (const x of d.samples) {
+        (x.source === 'api' ? M.api : M.worker).push({ t: x.t, d: x.data });
+        M.lastId = Math.max(M.lastId, x.id);
       }
-      if (body.duplicate) toast(`same file already imported as #${body.import_id}`);
-      location.hash = body.import_id;
-      loadRuns();
+      for (const arr of [M.worker, M.api]) while (arr.length && arr[0].t < d.now - KEEP) arr.shift();
+      M.imports = d.imports;
+      renderRuns();
+      renderSystem();
+    } catch (_) { /* server restarting: keep the last picture */ }
+    M.busy = false;
+    M.timer = setTimeout(pollMonitor, M.again ? 0 : 1000);
+    M.again = false;
+  }
+
+  const active = i => ['uploading', 'queued', 'processing'].includes(i.status);
+
+  // The run to show: the latest group of imports that overlap in time (a batch dropped together).
+  function runGroup() {
+    const now = Date.now() + M.offset;
+    const imps = M.imports.filter(i => i.created_ms).sort((a, b) => a.created_ms - b.created_ms);
+    const group = [];
+    let end = -Infinity;
+    for (const i of imps) {
+      const e = i.finished_ms || now;
+      if (i.created_ms > end + 5000) group.length = 0;
+      group.push(i);
+      end = Math.max(end, e);
+    }
+    return { group, end, now };
+  }
+
+  function windowRange() {
+    const { group, end, now } = runGroup();
+    if (!group.length) return { start: now - 60e3, end: now, group, live: true };
+    const live = group.some(active) || now - end < 2000;
+    const start = Math.max(Math.min(...group.map(i => i.created_ms)) - 3000, now - KEEP);
+    return live ? { start: Math.min(start, now - 20e3), end: now, group, live }
+                : { start, end: end + 3000, group, live };
+  }
+
+  // Nearest api sample for each worker sample (both are sorted by time).
+  function aligned(start, end) {
+    const W = M.worker.filter(x => x.t >= start - 1000 && x.t <= end + 1000);
+    const out = [];
+    let j = 0;
+    for (let i = 0; i < W.length; i++) {
+      const w = W[i];
+      while (j + 1 < M.api.length && Math.abs(M.api[j + 1].t - w.t) <= Math.abs(M.api[j].t - w.t)) j++;
+      const a = M.api[j] && Math.abs(M.api[j].t - w.t) < 1500 ? M.api[j].d : null;
+      const p = W[i - 1];
+      const dt = p ? (w.t - p.t) / 1000 : 0;
+      const pg = w.d.pg, pp = p?.d.pg;
+      out.push({
+        t: w.t, cores: w.d.cores, running: (w.d.running || []).length,
+        cpu: { worker: w.d.self.cpu, api: a ? a.self.cpu : 0, db: w.d.db ? w.d.db.cpu : null, machine: w.d.machine.cpu },
+        mem: { worker: w.d.self.mem, api: a ? a.self.mem : 0, db: w.d.db ? w.d.db.mem : null,
+          used: w.d.machine.mem_used, total: w.d.machine.mem_total },
+        wal: pg && pp && dt > 0 ? Math.max(0, (pg.wal - pp.wal) / 2 ** 20 / dt) : 0,
+        ins: pg && pp && dt > 0 ? Math.max(0, (pg.ins - pp.ins) / dt) : 0,
+      });
+    }
+    return out;
+  }
+
+  // Stacked areas: layers = [[key, value(x)], ...] bottom to top, clipped at max.
+  function stack(pts, layers, max, start, end) {
+    const X = t => (((t - start) / (end - start || 1)) * SW).toFixed(1);
+    const Y = v => (SH - (Math.min(v, max) / max) * (SH - 2)).toFixed(1);
+    const base = pts.map(() => 0);
+    return layers.map(([cls, f]) => {
+      if (!pts.length) return '';
+      const top = pts.map((p, i) => base[i] + Math.max(0, f(p) || 0));
+      let d = `M${X(pts[0].t)},${Y(base[0])}`;
+      pts.forEach((p, i) => { d += `L${X(p.t)},${Y(top[i])}`; });
+      for (let i = pts.length - 1; i >= 0; i--) d += `L${X(pts[i].t)},${Y(base[i])}`;
+      top.forEach((v, i) => { base[i] = v; });
+      return `<path class="f-${cls}" d="${d}Z"/>`;
+    }).join('');
+  }
+
+  const grid = `<line class="gl" x1="0" y1="${SH / 2}" x2="${SW}" y2="${SH / 2}"/>`;
+  const at = (pts, t) => {
+    if (!pts.length) return null;
+    let best = pts[pts.length - 1];
+    if (t != null) for (const p of pts) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    return best;
+  };
+  const gb = mb => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`);
+
+  function renderSystem() {
+    const { start, end, group, live } = windowRange();
+    M.range = [start, end];
+    const pts = aligned(start, end).filter(p => p.t >= start && p.t <= end);
+    const cores = pts[0]?.cores || S.cfg.cores || 1;
+    const dbSeen = pts.some(p => p.cpu.db != null);
+
+    // CPU: worker + api + db (when visible) + the rest of the machine
+    const cpuL = [['worker', p => p.cpu.worker], ['api', p => p.cpu.api]];
+    if (dbSeen) cpuL.push(['db', p => p.cpu.db]);
+    cpuL.push(['rest', p => p.cpu.machine - p.cpu.worker - p.cpu.api - (p.cpu.db || 0)]);
+    $('.tl[data-c="cpu"] svg').innerHTML = grid + stack(pts, cpuL, cores, start, end);
+
+    // RAM: what the app's processes hold (PSS); the machine total is in the readout
+    const ramL = [['worker', p => p.mem.worker], ['api', p => p.mem.api]];
+    if (dbSeen) ramL.push(['db', p => p.mem.db]);
+    const ramMax = Math.max(256, ...pts.map(p => p.mem.worker + p.mem.api + (p.mem.db || 0))) * 1.25;
+    $('.tl[data-c="ram"] svg').innerHTML = grid + stack(pts, ramL, ramMax, start, end);
+
+    // DB writes: WAL MB/s
+    const walMax = Math.max(4, ...pts.map(p => p.wal)) * 1.2;
+    $('.tl[data-c="db"] svg').innerHTML = grid + stack(pts, [['db', p => p.wal]], walMax, start, end);
+
+    // one bar per import: thin = uploading / waiting in the queue, thick = processing
+    const X = t => `${Math.max(0, Math.min(100, ((t - start) / (end - start || 1)) * 100)).toFixed(3)}%`;
+    const W = (a, b) => `${Math.max(0.3, ((Math.min(b, end) - Math.max(a, start)) / (end - start || 1)) * 100).toFixed(3)}%`;
+    const now = Date.now() + M.offset;
+    $('#gantt').innerHTML = group.slice(-10).map(i => {
+      const s0 = i.started_ms, f = i.finished_ms || now;
+      const bars = [];
+      if (i.status === 'uploading') bars.push(`<i class="gb up" style="left:${X(i.created_ms)};width:${W(i.created_ms, now)}"></i>`);
+      else bars.push(`<i class="gb q" style="left:${X(i.created_ms)};width:${W(i.created_ms, s0 || now)}"></i>`);
+      if (s0) bars.push(`<i class="gb ${i.status === 'processing' ? 'run' : i.status}" style="left:${X(s0)};width:${W(s0, f)}"></i>`);
+      const rate = i.elapsed > 0 ? ` · ${fmt(Math.round(i.rows / i.elapsed))} rows/s` : '';
+      return `<div class="grow${i.id === S.id ? ' cur' : ''}" data-id="${i.id}" title="#${i.id} ${esc(i.file_name)} · campaign ${i.campaign_id} · ${i.status}${rate}">
+        <div class="gl-l">#${i.id} ${esc(i.file_name || '')}</div><div class="gt">${bars.join('')}</div></div>`;
+    }).join('') || '<div class="sys-empty">drop one or more csv files to see them run side by side</div>';
+
+    // time axis: seconds from the start of the window
+    const span = end - start, fit = Math.max(2, Math.floor(($('#axis').clientWidth || 600) / 80));
+    const step = [1e3, 2e3, 5e3, 10e3, 15e3, 30e3, 60e3, 120e3, 300e3].find(x => span / x <= fit) || 600e3;
+    const ticks = [];
+    for (let t = 0; t <= span; t += step) ticks.push(`<span style="left:${((t / span) * 100).toFixed(2)}%">${t ? `+${clock(t)}` : clock(0)}</span>`);
+    $('#axis').innerHTML = ticks.join('');
+
+    // header: what ran, how long, at what rate, what it peaked at
+    if (group.length) {
+      const rows = group.reduce((a, i) => a + (i.rows || 0), 0);
+      const t0 = Math.min(...group.map(i => i.started_ms || i.created_ms));
+      const t1 = group.some(active) ? now : Math.max(...group.map(i => i.finished_ms || now));
+      const run = pts.filter(p => p.t >= t0 && p.t <= t1);
+      const pk = f => Math.max(0, ...run.map(f));
+      const runningNow = group.filter(i => i.status === 'processing').length, queued = group.filter(i => i.status === 'queued').length;
+      $('#sysSub').innerHTML = `${live ? '<b>live</b> · ' : 'last run · '}${group.length} import${group.length > 1 ? 's' : ''}` +
+        (live && (runningNow || queued) ? ` (${runningNow} running${queued ? `, ${queued} waiting` : ''})` : '') +
+        ` · ${fmt(rows)} rows in <b>${clock(t1 - t0)}</b>` + (t1 > t0 ? ` · <b>${fmt(Math.round(rows / ((t1 - t0) / 1000)))}</b> rows/s` : '') +
+        (run.length ? ` · peak CPU <b>${pk(p => p.cpu.machine).toFixed(1)}</b>/${cores} · peak worker RAM <b>${gb(pk(p => p.mem.worker))}</b>` : '');
+    } else $('#sysSub').textContent = `idle · ${S.cfg.slots || 1} parallel slot${(S.cfg.slots || 1) > 1 ? 's' : ''}`;
+    renderReadouts(pts);
+  }
+
+  // Readouts for the hovered moment (else the latest sample): a headline value and each layer's share.
+  function renderReadouts(pts) {
+    const p = at(pts, M.hover);
+    const set = (c, head, keys) => {
+      $(`.tl[data-c="${c}"] .tl-v`).innerHTML = head;
+      $(`.tl[data-c="${c}"] .lg`).innerHTML = keys.map(([cls, label, v]) =>
+        `<span><i class="k ${cls}"></i>${label}${v != null ? ` <b>${v}</b>` : ''}</span>`).join('');
     };
-    xhr.send(file);
+    if (!p) { ['cpu', 'ram', 'db'].forEach(c => set(c, '<span>no samples yet</span>', [])); return; }
+    const c = p.cpu, m = p.mem, db = c.db != null;
+    const rest = Math.max(0, c.machine - c.worker - c.api - (c.db || 0));
+    set('cpu', `${c.machine.toFixed(1)} <span>/ ${p.cores} cores</span>`, [
+      ['worker', 'worker', c.worker.toFixed(1)], ['api', 'api', c.api.toFixed(1)],
+      ...(db ? [['db', 'db', c.db.toFixed(1)], ['rest', 'other', rest.toFixed(1)]] : [['rest', 'db + other', rest.toFixed(1)]])]);
+    set('ram', `${gb(m.worker + m.api + (m.db || 0))} <span>/ ${gb(m.total)}</span>`, [
+      ['worker', 'worker', gb(m.worker)], ['api', 'api', gb(m.api)], ...(db ? [['db', 'db', gb(m.db)]] : []),
+      ['rest', 'machine used', gb(m.used)]]);
+    set('db', `${p.wal.toFixed(1)} <span>MB/s WAL</span>`, [
+      ['db', 'rows inserted/s', fmt(Math.round(p.ins))], ['rest', 'imports running', p.running]]);
+  }
+
+  function wireSystem() {
+    const body = $('#sysBody'), line = $('#hover');
+    body.addEventListener('mousemove', e => {
+      const g = $('.tl-g', body).getBoundingClientRect(), b = body.getBoundingClientRect();
+      if (e.clientX < g.left || e.clientX > g.right) { M.hover = null; line.classList.remove('on'); renderSystem(); return; }
+      const [start, end] = M.range;
+      M.hover = start + ((e.clientX - g.left) / g.width) * (end - start);
+      line.style.left = `${e.clientX - b.left}px`;
+      line.classList.add('on');
+      renderReadouts(aligned(start, end).filter(p => p.t >= start && p.t <= end));
+    });
+    body.addEventListener('mouseleave', () => { M.hover = null; line.classList.remove('on'); renderSystem(); });
+    $('#gantt').addEventListener('click', e => { const r = e.target.closest('.grow'); if (r) location.hash = r.dataset.id; });
   }
 
   // ---------------------------------------------------------------- wiring
@@ -377,19 +613,29 @@
     $$('#runsBody .rr').forEach(b => { b.textContent = `re-run · ${S.cap ?? 'auto'}`; });
   }
 
-  async function loadRuns() {
-    let rows = [];
-    try { rows = await api('/api/imports?limit=10'); } catch (_) { return; }
+  function renderRuns() {
+    const rows = M.imports;
     $('#runs').classList.toggle('hidden', !rows.length);
+    const running = rows.filter(r => r.status === 'processing').length;
+    $('#runsSub').textContent = rows.length ? `${running} of ${S.cfg.slots || 1} slots busy` : '';
     $('#runsBody').innerHTML = rows.map(r => {
-      const secs = r.seconds != null ? Number(r.seconds) : null;
-      const cores = r.cores ? `${r.cores_used ?? r.cores}` : `auto${r.cores_used ? ` (${r.cores_used})` : ''}`;
-      return `<tr data-id="${r.id}" class="${r.id === S.id ? 'cur' : ''}">
+      const secs = r.seconds != null ? Number(r.seconds) : null, el = Number(r.elapsed || 0);
+      const up = r.status === 'uploading' ? S.uploads.get(r.file_name) : null;
+      const p = r.status === 'done' ? 1 : up ? up.loaded / (up.total || 1) : r.est_rows ? Math.min(1, r.rows / r.est_rows) : 0;
+      const bar = r.status === 'uploading' ? 'up' : r.status === 'done' ? 'done' : r.status === 'failed' ? 'failed' : '';
+      const why = Object.entries(r.reasons || {}).map(([k, v]) => `${k} ${fmt(v)}`).join(', ');
+      const cs = r.chunk_stats || {};
+      const tip = `invalid: ${why || 'none'} · blanked e-mails ${fmt(cs.email_blanked)}, dates ${fmt(cs.date_blanked)} · ${fmt(cs.chunks)} chunks`;
+      const status = r.blocked_by ? `<span class="wait">waiting for #${r.blocked_by}</span>` : esc(r.status);
+      const t = secs != null ? `${secs.toFixed(2)} s` : r.status === 'processing' ? `${el.toFixed(1)} s` : '–';
+      const rate = secs ? r.rows / secs : r.status === 'processing' && el > 0 ? r.rows / el : 0;
+      return `<tr data-id="${r.id}" class="${r.id === S.id ? 'cur' : ''}" title="${esc(tip)}">
         <td>${r.id}</td><td class="f" title="${esc(r.file_name)}">${esc(r.file_name || '')}</td>
-        <td class="n">${fmt(r.rows)}</td><td class="n">${cores}</td>
-        <td class="n t">${secs != null ? `${secs.toFixed(2)} s` : '–'}</td>
-        <td class="n">${secs ? fmt(Math.round(r.rows / secs)) : '–'}</td>
-        <td class="st-${esc(r.status)}">${esc(r.status)}</td>
+        <td class="n">${r.campaign_id}</td>
+        <td><div class="pg"><div class="pg-b"><i class="${bar}" style="width:${(p * 100).toFixed(1)}%"></i></div><span class="pg-t">${Math.round(p * 100)}%</span></div></td>
+        <td class="n ok">${fmt(r.valid_rows)}</td><td class="n dup">${fmt(r.duplicate_rows)}</td><td class="n bad">${fmt(r.invalid_rows)}</td>
+        <td class="n t">${t}</td><td class="n">${rate ? fmt(Math.round(rate)) : '–'}</td>
+        <td class="st-${esc(r.status)}">${status}</td>
         <td>${r.status === 'done' ? `<button class="rr" type="button" data-rerun="${r.id}">re-run · ${S.cap ?? 'auto'}</button>` : ''}</td></tr>`;
     }).join('');
   }
@@ -399,7 +645,7 @@
       const r = await api(`/api/imports/${id}/rerun${S.cap ? `?cores=${S.cap}` : ''}`, { method: 'POST' });
       toast(`re-running #${id} as #${r.import_id} on ${S.cap ? `${S.cap} core${S.cap > 1 ? 's' : ''}` : 'auto cores'}`);
       location.hash = r.import_id;
-      loadRuns();
+      pollMonitor();
     } catch (e) { toast(e.message, true); }
   }
 
@@ -454,18 +700,31 @@
       Object.assign(S, { id: null, imp: null, events: [], lastEvent: 0, segs: [], total: 0, t: 0, shown: -2 });  // -2 forces a redraw
       setPlaying(false);
       history.replaceState(null, '', location.pathname);
-      $('#dropT').textContent = 'drop a csv';
-      $('#dropS').textContent = 'columns: phone, name, country · others kept as vars';
+      $('#dropT').textContent = 'drop csv files';
+      $('#dropS').textContent = 'one or several at once · columns: phone, name, country, email, birthday …';
       drawCharts();
       toast(`database reset · ${r.files_removed} file(s) removed`);
-      loadRuns();
+      pollMonitor();
     } catch (e) { toast(e.message, true); }
     b.disabled = false;
   }
 
+  function renderCampSeg() {
+    $$('#campSeg button').forEach(b => b.classList.toggle('on', b.dataset.m === S.camp));
+  }
+
   function wire() {
     wireInfo();
+    wireSystem();
     renderCoreSeg();
+    renderCampSeg();
+    $('#campSeg').addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      S.camp = b.dataset.m;
+      try { localStorage.setItem('campMode', S.camp); } catch (_) { /* private mode */ }
+      renderCampSeg();
+    });
     $('#coreSeg').addEventListener('click', e => {
       const b = e.target.closest('button');
       if (!b || b.disabled) return;
@@ -479,16 +738,15 @@
       const tr = e.target.closest('tr[data-id]');
       if (tr) location.hash = tr.dataset.id;
     });
-    loadRuns();
+    pollMonitor();
     const rb = $('#resetBtn');
     rb.classList.toggle('hidden', S.cfg.allow_reset === false);
     rb.addEventListener('click', resetDb);
     const drop = $('#drop'), file = $('#file');
-    file.addEventListener('change', () => { if (file.files[0]) upload(file.files[0]); file.value = ''; });
+    file.addEventListener('change', () => { if (file.files.length) upload([...file.files]); file.value = ''; });
     ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
     ['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
-    drop.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f && !drop.classList.contains('busy')) upload(f); });
-    drop.addEventListener('click', e => { if (drop.classList.contains('busy')) e.preventDefault(); });
+    drop.addEventListener('drop', e => { if (e.dataTransfer.files.length) upload([...e.dataTransfer.files]); });
 
     $('#playBtn').addEventListener('click', () => setPlaying(!S.playing));
     $$('#speeds button').forEach(b => b.addEventListener('click', () => {

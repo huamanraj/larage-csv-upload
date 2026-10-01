@@ -14,17 +14,56 @@
 <main class="shell">
   <div class="top">
     <label class="drop" id="drop">
-      <input type="file" id="file" accept=".csv,text/csv" hidden>
-      <span class="drop-t" id="dropT">drop a csv</span>
-      <span class="drop-s" id="dropS">columns: phone, name, country · others kept as vars</span>
+      <input type="file" id="file" accept=".csv,text/csv" multiple hidden>
+      <span class="drop-t" id="dropT">drop csv files</span>
+      <span class="drop-s" id="dropS">one or several at once · columns: phone, name, country, email, birthday …</span>
       <i class="drop-bar" id="dropBar"></i>
     </label>
+    <div class="cores">
+      <span class="cl">campaign</span>
+      <div class="seg" id="campSeg">
+        <button type="button" data-m="own">own per file</button><button type="button" data-m="shared">shared</button>
+      </div>
+      <button class="info" type="button" data-info="campaign" aria-label="About: campaign">i</button>
+    </div>
     <div class="cores">
       <span class="cl">cores</span>
       <div class="seg" id="coreSeg"></div>
       <button class="info" type="button" data-info="cores" aria-label="About: cores">i</button>
     </div>
   </div>
+
+  <section class="sys" id="sys">
+    <div class="sys-h">
+      <span>system</span><span class="sys-sub" id="sysSub"></span>
+      <button class="info" type="button" data-info="system" aria-label="About: system">i</button>
+    </div>
+    <div class="sys-b" id="sysBody">
+      <div class="tl" data-c="cpu">
+        <div class="tl-l"><div class="tl-n">CPU<span class="tl-v"></span></div><div class="lg"></div></div>
+        <svg class="tl-g" viewBox="0 0 1000 56" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="tl" data-c="ram">
+        <div class="tl-l"><div class="tl-n">RAM<span class="tl-v"></span></div><div class="lg"></div></div>
+        <svg class="tl-g" viewBox="0 0 1000 56" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="tl" data-c="db">
+        <div class="tl-l"><div class="tl-n">DB writes<span class="tl-v"></span></div><div class="lg"></div></div>
+        <svg class="tl-g" viewBox="0 0 1000 56" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="gantt" id="gantt"></div>
+      <div class="axis"><div></div><div class="ax" id="axis"></div></div>
+      <div class="hover" id="hover"></div>
+    </div>
+  </section>
+
+  <section class="runs hidden" id="runs">
+    <div class="runs-h"><span>imports</span><span class="sys-sub" id="runsSub"></span><button class="info" type="button" data-info="runs" aria-label="About: imports">i</button></div>
+    <div class="runs-w"><table>
+      <thead><tr><th>#</th><th>file</th><th class="n">campaign</th><th>progress</th><th class="n">saved</th><th class="n">dup</th><th class="n">invalid</th><th class="n">time</th><th class="n">rows/s</th><th>status</th><th></th></tr></thead>
+      <tbody id="runsBody"></tbody>
+    </table></div>
+  </section>
 
   <section class="flow">
     <div class="col">
@@ -96,13 +135,6 @@
     </div>
   </section>
 
-  <section class="runs hidden" id="runs">
-    <div class="runs-h"><span>runs</span><button class="info" type="button" data-info="runs" aria-label="About: runs">i</button></div>
-    <div class="runs-w"><table>
-      <thead><tr><th>#</th><th>file</th><th class="n">rows</th><th class="n">cores</th><th class="n">time</th><th class="n">rows/s</th><th>status</th><th></th></tr></thead>
-      <tbody id="runsBody"></tbody>
-    </table></div>
-  </section>
 </main>
 <div class="toast" id="toast"></div>
 <button class="reset hidden" id="resetBtn" type="button" title="Delete all imports, contacts and uploaded files">reset db</button>

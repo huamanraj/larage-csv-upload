@@ -1,6 +1,8 @@
-"""Phone validation. Runs inside the worker's process pool, so keep it import-light and pure."""
+"""Row validation: phone numbers (plus e-mail and date fields). Runs inside the worker's process pool, so keep
+it import-light and pure."""
 import json
 import re
+from datetime import date, datetime
 from pathlib import Path
 
 import phonenumbers
@@ -9,6 +11,10 @@ from phonenumbers import PhoneNumberFormat
 NON_DIGIT = re.compile(r"\D")
 FAST_IN = re.compile(r"^(?:91|0)?([6-9]\d{9})$")          # Indian mobile, the common case
 SCI = re.compile(r"^\s*[+-]?\d+(?:\.\d+)?[eE][+-]?\d+\s*$")  # Excel's 9.19E+11: digits already lost
+JUNK = re.compile(r"(\d)\1{7}$")                           # 9999999999, 9000000000: placeholders, not people
+MIN_DIGITS = 5                                              # shorter is never a phone number
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d.%m.%Y", "%m/%d/%y", "%d/%m/%y")
 
 # Country cell -> region code: ISO codes, English names, calling codes and common spellings.
 # Names ship as JSON because importing phonenumbers.geocoder costs ~100 MB RSS per process.
@@ -52,8 +58,9 @@ def _valid(text, region):
 
 
 def normalize(raw, region="IN"):
-    """Return (e164, None) or (None, reason) with reason in empty | invalid | sci_notation.
+    """Return (e164, None) or (None, reason), cheapest checks first.
 
+    Reasons: empty | sci_notation (Excel 9.19E+11) | too_short (< 5 digits) | invalid | junk (9999999999).
     1. '+' or '00' prefix: the number carries its own country code.
     2. Indian mobiles take a regex fast path (no slow parser).
     3. Otherwise parse as a national number of `region` (the row's country, else the default).
@@ -67,28 +74,59 @@ def normalize(raw, region="IN"):
     digits = NON_DIGIT.sub("", s)
     if not digits:
         return None, "invalid"
+    if len(digits) < MIN_DIGITS:
+        return None, "too_short"
     explicit = s.startswith("+") or s.startswith("00")
     if s.startswith("00"):
         digits = digits[2:]
     if (explicit and len(digits) == 12 and digits.startswith("91")) or (not explicit and region == "IN"):
         m = FAST_IN.match(digits)
         if m:
-            return "+91" + m.group(1), None
+            return (None, "junk") if JUNK.search(m.group(1)) else ("+91" + m.group(1), None)
     num = _valid("+" + digits, None) if explicit else _valid(s, region)
     if num is None and not explicit and len(digits) >= 11:
         num = _valid("+" + digits, None)
     if num is None:
         return None, "invalid"
+    if JUNK.search(str(num.national_number)):
+        return None, "junk"
     return phonenumbers.format_number(num, PhoneNumberFormat.E164), None
 
 
-def validate_batch(rows, region):
-    """rows: [(row_no, (phone candidates in priority order), name, country, vars_json)].
+def clean_email(value):
+    """Lower-cased address, or '' when it is not an e-mail address (the field is blanked, the row kept)."""
+    v = value.strip().lower()
+    return v if EMAIL.match(v) else ""
 
-    The first valid candidate wins. A rejected row reports its first non-empty value and why.
+
+def clean_date(value, today=None):
+    """ISO date (YYYY-MM-DD), or '' for placeholders like Outlook's 0/0/00 and impossible dates."""
+    v = value.strip()[:10]
+    for fmt in DATE_FORMATS:
+        try:
+            d = datetime.strptime(v, fmt).date()
+        except ValueError:
+            continue
+        return d.isoformat() if date(1900, 1, 1) <= d <= (today or date.today()) else ""
+    return ""
+
+
+CLEANERS = {"email": clean_email, "date": clean_date}
+
+
+def validate_batch(rows, region, fields=()):
+    """rows: [(row_no, (phone candidates in priority order), name, country, (extra cell values))].
+    fields: [(column name, kind)] for the extra cells; kind 'email' or 'date' is checked, None is kept as is.
+
+    The first valid phone candidate wins; a rejected row reports its first non-empty value and why.
+    Bad e-mails and dates blank that field only. Returns (ok, bad, stats):
+      ok    [(row_no, e164, name, vars_json)]
+      bad   [(row_no, raw_phone, reason)]
+      stats {'reasons': {reason: n}, 'email_blanked': n, 'date_blanked': n}
     """
     ok, bad = [], []
-    for row_no, phones, name, country, vars_json in rows:
+    reasons, blanked = {}, {"email": 0, "date": 0}
+    for row_no, phones, name, country, extras in rows:
         row_region = region_for(country, region)
         e164, first = None, None
         for raw in phones:
@@ -97,8 +135,19 @@ def validate_batch(rows, region):
                 break
             if first is None and reason != "empty":
                 first = (raw, reason)
-        if e164:
-            ok.append((row_no, e164, name or None, vars_json))
-        else:
-            bad.append((row_no, *(first or (None, "empty"))))
-    return ok, bad
+        if not e164:
+            first = first or (None, "empty")
+            reasons[first[1]] = reasons.get(first[1], 0) + 1
+            bad.append((row_no, *first))
+            continue
+        out = {}
+        for (col, kind), v in zip(fields, extras or ()):
+            if v and kind:
+                c = CLEANERS[kind](v)
+                if not c:
+                    blanked[kind] += 1
+                v = c
+            if v:
+                out[col] = v
+        ok.append((row_no, e164, name or None, json.dumps(out) if out else None))
+    return ok, bad, {"reasons": reasons, "email_blanked": blanked["email"], "date_blanked": blanked["date"]}

@@ -19,8 +19,19 @@ COUNTRY_COLUMNS = ["country", "country/region", "home country/region", "business
                    "other country/region", "home country", "business country"]
 
 
+DATE_COLUMNS = ("birthday", "anniversary", "dob", "date of birth", "birth date", "birthdate")
+
+
+def kind_of(h):
+    """Extra columns that get checked: e-mail addresses and dates. Everything else is kept as written."""
+    if ("email" in h or "e-mail" in h) and ("address" in h or h in ("email", "e-mail", "email id")):
+        return "email"
+    return "date" if h in DATE_COLUMNS else None
+
+
 def resolve(header):
-    """header -> column indices: {'phones': [...], 'name': [...], 'country': [...], 'extra': [(name, i)]}.
+    """header -> column indices: {'phones': [...], 'name': [...], 'country': [...], 'extra': [(name, i)],
+    'kinds': {i: 'email' | 'date'}}.
 
     'phones' is empty when the file has no usable phone column.
     """
@@ -42,4 +53,5 @@ def resolve(header):
     country = [pos[c] for c in COUNTRY_COLUMNS if c in pos]
     used = set(phones) | set(name) | set(country)
     extra = [(header[i].strip(), i) for i in range(len(header)) if i not in used and header[i].strip()]
-    return {"phones": phones, "name": name, "country": country, "extra": extra}
+    kinds = {i: k for _, i in extra if (k := kind_of(low[i]))}
+    return {"phones": phones, "name": name, "country": country, "extra": extra, "kinds": kinds}

@@ -104,6 +104,14 @@ To get real 8-core numbers, run `python scripts/bench_system.py --cores 2,4,8` o
 | 4 vCPU / 4–8 GB | ~28 s. About 1.2 of 4 cores busy | `IMPORT_CONCURRENCY=2` is safe |
 | 8 vCPU / 8–16 GB | ~25 s *(projected)* | 3–4 imports in parallel before cores run out |
 
+**Measured: parallel imports** (4 vCPU, 300k rows per file, wall time including uploads):
+- 1 file: 8.4 s.
+- 2 in parallel: 10.5 s, about 57k rows/s total.
+- 4 in parallel: 19.8 s, about 61k rows/s, with the CPU full.
+- 4 into the same campaign, one by one: 34.6 s.
+
+Worker RAM stays ~160 MB in every case. The live system panel in the UI shows the same thing for your own files; see the README, "Parallel imports".
+
 Beyond 4 cores, a single import barely gets faster. Extra cores buy **more imports in parallel**, not a faster single import. Making one import faster needs pipelining (read the next chunk while the current one saves) or cutting the per-row Python work; see the discussion in the docs.
 
 ## Raw data

@@ -61,3 +61,13 @@ CREATE TABLE IF NOT EXISTS import_events (
   at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX IF NOT EXISTS import_events_import_idx ON import_events (import_id, id);
+
+-- Live system charts: CPU and memory samples from the api and worker processes (every 0.5 s, kept 30 min).
+-- UNLOGGED: no WAL, so sampling never shows up in the database-write chart it feeds.
+CREATE UNLOGGED TABLE IF NOT EXISTS system_samples (
+  id bigserial PRIMARY KEY,
+  source text NOT NULL,                      -- api | worker
+  at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS system_samples_at_idx ON system_samples (at);

@@ -1,6 +1,10 @@
 """Import worker: takes queued imports from Postgres (FOR UPDATE SKIP LOCKED), streams the CSV
 in 10k-row chunks, validates them in a process pool and saves each chunk in one transaction.
 
+IMPORT_CONCURRENCY slots run in parallel (one thread each, sharing the validation pool), so several files
+are processed at once. Two imports into the same campaign never run together: they would race on its
+duplicate check, so the second waits in the queue.
+
 Run as its own process:  python -m app.worker
 """
 import csv
@@ -19,11 +23,12 @@ from psycopg.rows import dict_row
 from . import config
 from .db import init_schema
 from .columns import resolve
-from .metrics import ALLOWED_CPUS, CORES, RAM_TOTAL_MB, Usage, pin, tree_pids
+from .metrics import ALLOWED_CPUS, CORES, RAM_TOTAL_MB, SystemSampler, Usage, pin, tree_pids
 from .phones import validate_batch
 
 log = logging.getLogger("worker")
 STOP = threading.Event()
+RUNNING = set()  # import ids this worker is processing right now
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 csv.field_size_limit(16 * 1024 * 1024)
 
@@ -32,12 +37,16 @@ class LostLock(Exception):
     """Another worker re-claimed this import after our lock went stale."""
 
 
-# Take the oldest queued import (or one whose worker died) without blocking on rows others hold.
+LIVE = f"status='processing' AND locked_at >= now() - interval '{config.LOCK_TIMEOUT}'"
+
+# Take the oldest queued import (or one whose worker died) without blocking on rows others hold,
+# skipping imports whose campaign already has a live import (one import per campaign at a time).
 CLAIM_SQL = f"""
 UPDATE imports SET status='processing', locked_at=now(), worker_id=%(worker)s, started_at=coalesce(started_at, now())
-WHERE id = (SELECT id FROM imports
-            WHERE status='queued'
-               OR (status='processing' AND locked_at < now() - interval '{config.LOCK_TIMEOUT}')
+WHERE id = (SELECT id FROM imports i
+            WHERE (status='queued'
+                   OR (status='processing' AND locked_at < now() - interval '{config.LOCK_TIMEOUT}'))
+              AND NOT EXISTS (SELECT 1 FROM imports o WHERE o.campaign_id = i.campaign_id AND o.id <> i.id AND o.{LIVE})
             ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
 RETURNING *
 """
@@ -69,10 +78,11 @@ def connect():
 
 def claim(conn):
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute("SELECT pg_advisory_xact_lock(7332)")  # serialize claims so the concurrency cap holds
-        cur.execute(f"SELECT count(*) AS n FROM imports WHERE status='processing' "
-                    f"AND locked_at >= now() - interval '{config.LOCK_TIMEOUT}'")
-        if cur.fetchone()["n"] >= config.IMPORT_CONCURRENCY:
+        # Serialize claims, so the concurrency cap and the one-import-per-campaign rule both hold.
+        cur.execute("SELECT pg_advisory_xact_lock(7332)")
+        cur.execute(f"SELECT count(*) AS n FROM imports WHERE {LIVE}")
+        running = cur.fetchone()["n"]
+        if running >= config.IMPORT_CONCURRENCY:
             return None
         cur.execute(CLAIM_SQL, {"worker": WORKER_ID})
         job = cur.fetchone()
@@ -80,7 +90,8 @@ def claim(conn):
             cur.execute("SELECT count(*) AS n FROM import_events WHERE import_id=%s AND kind='chunk'", (job["id"],))
             job["chunks_done"] = cur.fetchone()["n"]
             event(cur, job["id"], "claimed", {"worker": WORKER_ID, "resume_from": job["checkpoint_row"],
-                                              "cores": CORES, "ram_mb": RAM_TOTAL_MB})
+                                              "cores": CORES, "ram_mb": RAM_TOTAL_MB, "running": running + 1,
+                                              "slots": config.IMPORT_CONCURRENCY})
         return job
 
 
@@ -91,21 +102,26 @@ class Job:
         self.slices = config.POOL_SIZE  # parallel validation slices per chunk
 
     def limit_cores(self):
-        """Apply the import's core cap: pin the worker and its validation processes to the first N CPUs and
-        validate in N slices. The cap covers the whole worker (read + validate), not Postgres."""
+        """Apply the import's core cap: validate in N slices and, with a single slot, also pin the worker and
+        its validation processes to the first N CPUs. With several slots the worker is shared by other
+        imports, so it is not pinned. The cap never covers Postgres."""
         cap = self.job.get("cores")
         if not cap:
-            return {"cap": None, "cores_used": len(ALLOWED_CPUS), "slices": self.slices}
+            return {"cap": None, "cores_used": len(ALLOWED_CPUS), "slices": self.slices, "pinned": False}
         n = max(1, min(cap, len(ALLOWED_CPUS)))
         self.slices = n
+        if config.IMPORT_CONCURRENCY > 1:
+            return {"cap": cap, "cores_used": n, "slices": n, "pinned": False}
         pinned = pin(tree_pids(), ALLOWED_CPUS[:n])
         return {"cap": cap, "cores_used": n, "cpus": ALLOWED_CPUS[:n], "slices": n, "pinned": pinned}
 
     def run(self):
+        RUNNING.add(self.id)
         try:
             self._run()
         finally:
-            if self.job.get("cores"):
+            RUNNING.discard(self.id)
+            if self.job.get("cores") and config.IMPORT_CONCURRENCY == 1:
                 pin(tree_pids(), ALLOWED_CPUS)  # give the worker all CPUs back for the next import
 
     def _run(self):
@@ -117,8 +133,13 @@ class Job:
             if not cols["phones"]:
                 raise RuntimeError("no phone column found")
             phones, names, countries, extra = cols["phones"], cols["name"], cols["country"], cols["extra"]
+            self.fields = tuple((h, cols["kinds"].get(i)) for h, i in extra)  # extra columns, e-mail/date checked
+            extra_idx = [i for _, i in extra]
             with self.conn.cursor() as cur:
-                event(cur, self.id, "opened", {"path": self.job["file_path"], "bytes": self.job["file_size"], **limits})
+                event(cur, self.id, "opened", {
+                    "path": self.job["file_path"], "bytes": self.job["file_size"], **limits,
+                    "slots": config.IMPORT_CONCURRENCY,
+                    "checked": {k: [h for h, kk in self.fields if kk == k] for k in ("email", "date")}})
             self.usage = Usage()  # CPU and RAM of this worker + its validation processes
 
             def cell(rec, i):
@@ -129,10 +150,10 @@ class Job:
                 row_no += 1
                 if row_no <= self.checkpoint or not rec:  # already saved before a restart
                     continue
-                vars_json = json.dumps({h: v for h, i in extra if (v := cell(rec, i))}) if extra else None
                 name = " ".join(v for i in names if (v := cell(rec, i)))
                 country = next((v for i in countries if (v := cell(rec, i))), "")
-                chunk.append((row_no, tuple(cell(rec, i) for i in phones), name, country, vars_json))
+                chunk.append((row_no, tuple(cell(rec, i) for i in phones), name, country,
+                              tuple(cell(rec, i) for i in extra_idx)))
                 if len(chunk) >= config.CHUNK_SIZE:
                     self.flush(chunk, row_no, time.monotonic() - t_read)
                     if STOP.is_set():
@@ -148,11 +169,15 @@ class Job:
         t0 = time.monotonic()
         k = max(1, min(self.slices, len(chunk) // 1000))
         size = -(-len(chunk) // k) if chunk else 1
-        ok, bad = [], []
-        for o, b in self.pool.map(validate_batch, [chunk[i:i + size] for i in range(0, len(chunk), size)],
-                                  [config.DEFAULT_REGION] * k):
+        ok, bad, reasons, blanked = [], [], {}, {"email_blanked": 0, "date_blanked": 0}
+        for o, b, st in self.pool.map(validate_batch, [chunk[i:i + size] for i in range(0, len(chunk), size)],
+                                      [config.DEFAULT_REGION] * k, [self.fields] * k):
             ok += o
             bad += b
+            for r, c in st["reasons"].items():
+                reasons[r] = reasons.get(r, 0) + c
+            for f in blanked:
+                blanked[f] += st[f]
         t1 = time.monotonic()
         cpu_validate, rss_validate = self.usage.tick()
 
@@ -184,6 +209,7 @@ class Job:
             event(cur, self.id, "chunk", {
                 "n": self.n, "first_row": self.checkpoint + 1, "last_row": last_row, "rows": len(chunk),
                 "valid": len(ok), "invalid": len(bad), "inserted": inserted, "dups": len(ok) - inserted,
+                "reasons": reasons, **blanked, "running": len(RUNNING),
                 "read_ms": ms(read_s), "validate_ms": ms(t1 - t0), "save_ms": ms(t2 - t1),
                 "progress_ms": ms(time.monotonic() - t2),
                 "cpu_read": cpu_read, "cpu_validate": cpu_validate, "cpu_save": cpu_save,
@@ -241,6 +267,31 @@ def slot_loop(pool):
             STOP.wait(2.0)
 
 
+def sample_loop():
+    """Every 0.5 s: CPU and memory of this worker (+ its validation processes), Postgres (when its processes are
+    visible, i.e. not in another container), the whole machine, and the database's write counters.
+    The UI draws these as the live system charts. Rows older than 30 minutes are pruned."""
+    sampler, conn, last_prune = SystemSampler("worker", watch_postgres=True), None, 0.0
+    while not STOP.is_set():
+        try:
+            if conn is None or conn.closed:
+                conn = psycopg.connect(config.DATABASE_URL, autocommit=True, row_factory=dict_row)
+            data = sampler.tick()
+            data["running"] = sorted(RUNNING)
+            data["pg"] = conn.execute(
+                """SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0')::bigint AS wal,
+                          tup_inserted AS ins, xact_commit AS commits FROM pg_stat_database
+                   WHERE datname = current_database()""").fetchone()
+            conn.execute("INSERT INTO system_samples (source, data) VALUES ('worker', %s)", (json.dumps(data),))
+            if time.monotonic() - last_prune > 60:
+                conn.execute("DELETE FROM system_samples WHERE at < now() - interval '30 min'")
+                last_prune = time.monotonic()
+        except psycopg.Error as e:
+            log.warning("sampler: %s", e)
+            conn = None
+        STOP.wait(SystemSampler.EVERY)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     init_schema()
@@ -254,6 +305,7 @@ def main():
         pool.submit(int).result()  # start the pool before any threads
         threads = [threading.Thread(target=slot_loop, args=(pool,), daemon=True)
                    for _ in range(config.IMPORT_CONCURRENCY)]
+        threading.Thread(target=sample_loop, daemon=True).start()
         for t in threads:
             t.start()
         while not STOP.is_set():

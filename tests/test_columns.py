@@ -11,7 +11,7 @@ def names(header, idx):
 
 def test_simple_schema():
     c = resolve(["Phone", "Name", "Country", "City"])
-    assert c == {"phones": [0], "name": [1], "country": [2], "extra": [("City", 3)]}
+    assert c == {"phones": [0], "name": [1], "country": [2], "extra": [("City", 3)], "kinds": {}}
 
 
 def test_outlook_export():
@@ -22,6 +22,7 @@ def test_outlook_export():
     extra = [n for n, _ in c["extra"]]
     assert "Business Fax" in extra and "Pager" in extra and "Government ID Number" in extra  # never phones
     assert "Company" in extra and "E-mail Address" in extra
+    assert [OUTLOOK[i] for i, k in c["kinds"].items() if k == "email"] == ["E-mail Address"]  # not "Display Name"
 
 
 def test_no_phone_column():
