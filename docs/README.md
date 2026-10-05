@@ -21,6 +21,7 @@ The repo already holds a working implementation of the proposed design (`app/`).
 
 ### Node / BullMQ teams
 
+- [Contact import microservice](contact-import-microservice.md): the same import behaviour moved into its own service (`sd-contact-import`), with batch writes, new job tables, schema changes, a parity checklist and a rollout plan.
 - [Real server analysis](real-server-analysis.md): the production campaign CSV worker (NestJS + Pub/Sub + MySQL) analysed from a 12-day CubeAPM export. Finding: ~42 ms per row from per-row auto-committed queries. Includes ranked issues and a batched redesign.
 
 - [CSV import guide for BullMQ + Postgres](csv-import-guide-bullmq.md): column mapping for messy CSVs, the cheapest phone validation, duplicates with one batched `ON CONFLICT` insert, and why 20k rows taking 5 minutes means per-row work (with a fix checklist and a TypeScript worker).
